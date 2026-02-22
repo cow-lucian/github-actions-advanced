@@ -1,0 +1,442 @@
+# =============================================================================
+# 01 - Container Jobs
+# =============================================================================
+# Jobs can run inside Docker containers, giving you full control over the
+# execution environment. This is useful for:
+#   - Reproducible builds with exact dependency versions
+#   - Testing against specific OS/library configurations
+#   - Running jobs that need services (databases, caches, etc.)
+#
+# Key concepts:
+#   container:        The Docker image to run the job steps in
+#   container.image:  Docker image (required)
+#   container.env:    Environment variables for the container
+#   container.ports:  Ports to expose on the container
+#   container.volumes: Volumes to mount
+#   container.options: Additional docker create options
+#   services:         Sidecar containers (databases, caches, etc.)
+# =============================================================================
+
+name: "01 - Container Jobs"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Minimal permissions - only what's needed
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Basic container job
+  # ---------------------------------------------------------------------------
+  # The job runs inside the specified Docker container instead of directly
+  # on the runner's host OS. The runner pulls the image, starts a container,
+  # and executes each step inside it.
+  # ---------------------------------------------------------------------------
+  basic-container:
+    name: "Basic Container Job"
+    runs-on: ubuntu-latest
+
+    # Run all steps inside this container
+    container:
+      # Use a specific tag (not :latest) for reproducibility
+      image: node:20.11-bookworm
+
+      # Environment variables available to ALL steps in this job
+      env:
+        NODE_ENV: test
+        CI: "true"
+
+      # Expose ports from the container to the runner host
+      # Format: host_port:container_port or just container_port
+      ports:
+        - 3000:3000
+        - 8080
+
+      # Mount volumes into the container
+      # The workspace is automatically mounted, but you can add more
+      volumes:
+        - /tmp/artifacts:/artifacts
+        - my_volume:/data
+
+      # Additional `docker create` options
+      # Common options: --cpus, --memory, --user, --workdir, --shm-size
+      options: >-
+        --cpus 2
+        --memory 4g
+        --shm-size 2g
+        --user root
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify we're in the container
+        run: |
+          echo "Node version: $(node --version)"
+          echo "NPM version: $(npm --version)"
+          echo "OS: $(cat /etc/os-release | grep PRETTY_NAME)"
+          echo "User: $(whoami)"
+          echo "Working directory: $(pwd)"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Write artifact to mounted volume
+        run: |
+          echo "Build completed at $(date)" > /artifacts/build-info.txt
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Container job with service containers
+  # ---------------------------------------------------------------------------
+  # Service containers are Docker containers that provide services like
+  # databases, caches, or message queues for your job. They are started
+  # before any steps run and torn down after the job completes.
+  #
+  # IMPORTANT: When your job runs in a container, services are accessed by
+  # their service label as hostname (e.g., "postgres", "redis").
+  # When your job runs directly on the runner, services are accessed via
+  # localhost with the mapped port.
+  # ---------------------------------------------------------------------------
+  with-services:
+    name: "Container + Services"
+    runs-on: ubuntu-latest
+
+    # Job container
+    container:
+      image: node:20.11-bookworm
+
+    # Service containers - accessible by their key name as hostname
+    services:
+      # -----------------------------------------------------------------------
+      # PostgreSQL service
+      # -----------------------------------------------------------------------
+      postgres:
+        image: postgres:16.2-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        # Health check ensures the service is ready before steps run
+        # Without this, your steps might fail because the DB isn't ready yet
+        options: >-
+          --health-cmd="pg_isready -U testuser -d testdb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+          --health-start-period=30s
+
+      # -----------------------------------------------------------------------
+      # Redis service
+      # -----------------------------------------------------------------------
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      # When running in a container, use the service label as the hostname
+      DATABASE_URL: postgresql://testuser:testpass@postgres:5432/testdb
+      REDIS_URL: redis://redis:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: |
+          apt-get update && apt-get install -y postgresql-client
+
+      - name: Verify PostgreSQL connectivity
+        run: |
+          # Access via hostname "postgres" (the service label)
+          pg_isready -h postgres -p 5432 -U testuser
+          psql "$DATABASE_URL" -c "SELECT version();"
+
+      - name: Verify Redis connectivity
+        run: |
+          # Install redis-tools for the CLI
+          apt-get install -y redis-tools
+          # Access via hostname "redis" (the service label)
+          redis-cli -h redis -p 6379 ping
+
+      - name: Run database migrations
+        run: |
+          # Example: run migrations against the test database
+          echo "Running migrations against $DATABASE_URL"
+          psql "$DATABASE_URL" -c "
+            CREATE TABLE IF NOT EXISTS users (
+              id SERIAL PRIMARY KEY,
+              name TEXT NOT NULL,
+              email TEXT UNIQUE NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+          "
+
+      - name: Install dependencies and run integration tests
+        run: |
+          npm ci
+          npm test
+        env:
+          # These are available to this step
+          DATABASE_URL: postgresql://testuser:testpass@postgres:5432/testdb
+          REDIS_URL: redis://redis:6379
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Services WITHOUT a job container (runner host)
+  # ---------------------------------------------------------------------------
+  # When your job runs directly on the runner (no `container` key), services
+  # are accessed via localhost with the FIRST mapped port.
+  # ---------------------------------------------------------------------------
+  services-on-host:
+    name: "Services on Host (no container)"
+    runs-on: ubuntu-latest
+
+    # No `container` key - steps run directly on the Ubuntu runner
+
+    services:
+      postgres:
+        image: postgres:16.2-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        # When running on the host, you MUST map ports
+        # The first port is the host port (what you connect to)
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U testuser -d testdb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Verify services via localhost
+        run: |
+          # On the host, use localhost (NOT the service label)
+          pg_isready -h localhost -p 5432 -U testuser
+          redis-cli -h localhost -p 6379 ping
+
+      - name: Install and test
+        run: |
+          npm ci
+          npm test
+        env:
+          # Use localhost, not the service name
+          DATABASE_URL: postgresql://testuser:testpass@localhost:5432/testdb
+          REDIS_URL: redis://localhost:6379
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Container credentials for private registries
+  # ---------------------------------------------------------------------------
+  # If your container image is in a private registry, you need credentials.
+  # This section is commented out as it requires actual registry credentials.
+  # ---------------------------------------------------------------------------
+  # private-registry:
+  #   name: "Private Registry Container"
+  #   runs-on: ubuntu-latest
+  #
+  #   container:
+  #     # Private registry image
+  #     image: ghcr.io/cow-lucian/private-app:latest
+  #     # Credentials for pulling the image
+  #     credentials:
+  #       username: ${{ github.actor }}
+  #       password: ${{ secrets.GITHUB_TOKEN }}
+  #     env:
+  #       APP_ENV: test
+  #
+  #   services:
+  #     # Service from a private registry
+  #     custom-db:
+  #       image: ghcr.io/cow-lucian/custom-postgres:latest
+  #       credentials:
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #       ports:
+  #         - 5432:5432
+  #       options: >-
+  #         --health-cmd="pg_isready"
+  #         --health-interval=10s
+  #         --health-timeout=5s
+  #         --health-retries=5
+  #
+  #   # For AWS ECR:
+  #   # container:
+  #   #   image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:latest
+  #   #   credentials:
+  #   #     username: AWS
+  #   #     password: ${{ secrets.ECR_PASSWORD }}
+  #
+  #   # For Docker Hub private images:
+  #   # container:
+  #   #   image: myorg/private-image:latest
+  #   #   credentials:
+  #   #     username: ${{ secrets.DOCKER_USERNAME }}
+  #   #     password: ${{ secrets.DOCKER_PASSWORD }}
+  #
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Run tests in private container
+  #       run: npm test
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Multi-container integration test
+  # ---------------------------------------------------------------------------
+  # A realistic example combining multiple services for a full integration
+  # test environment.
+  # ---------------------------------------------------------------------------
+  full-integration:
+    name: "Full Integration Test"
+    runs-on: ubuntu-latest
+
+    container:
+      image: node:20.11-bookworm
+      env:
+        NODE_ENV: test
+
+    services:
+      postgres:
+        image: postgres:16.2-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: myapp_test
+        options: >-
+          --health-cmd="pg_isready -U app -d myapp_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7.2-alpine
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      # Elasticsearch service for search functionality
+      elasticsearch:
+        image: elasticsearch:8.12.0
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd="curl -f http://localhost:9200/_cluster/health || exit 1"
+          --health-interval=15s
+          --health-timeout=10s
+          --health-retries=10
+          --health-start-period=60s
+
+      # MinIO (S3-compatible storage)
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+        # MinIO needs a command override; use options for health check
+        options: >-
+          --health-cmd="curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y postgresql-client redis-tools curl
+
+      - name: Wait for all services
+        run: |
+          echo "Checking PostgreSQL..."
+          pg_isready -h postgres -p 5432 -U app
+
+          echo "Checking Redis..."
+          redis-cli -h redis -p 6379 ping
+
+          echo "Checking Elasticsearch..."
+          curl -sf http://elasticsearch:9200/_cluster/health?wait_for_status=yellow&timeout=60s
+
+          echo "Checking MinIO..."
+          curl -sf http://minio:9000/minio/health/live
+
+          echo "All services are ready!"
+
+      - name: Setup test database
+        run: |
+          psql postgresql://app:secret@postgres:5432/myapp_test -c "
+            CREATE TABLE IF NOT EXISTS users (
+              id SERIAL PRIMARY KEY,
+              email TEXT UNIQUE NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+              id UUID PRIMARY KEY,
+              user_id INT REFERENCES users(id),
+              data JSONB,
+              expires_at TIMESTAMPTZ
+            );
+          "
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run full integration test suite
+        run: npm test
+        env:
+          DATABASE_URL: postgresql://app:secret@postgres:5432/myapp_test
+          REDIS_URL: redis://redis:6379
+          ELASTICSEARCH_URL: http://elasticsearch:9200
+          S3_ENDPOINT: http://minio:9000
+          S3_ACCESS_KEY: minioadmin
+          S3_SECRET_KEY: minioadmin
+          S3_BUCKET: test-bucket

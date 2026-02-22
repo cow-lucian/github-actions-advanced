@@ -1,0 +1,361 @@
+# =============================================================================
+# 05 - Using Composite Actions
+# =============================================================================
+# Composite actions bundle multiple steps into a single reusable action.
+# They are defined in an action.yml file and can:
+#   - Run multiple shell commands
+#   - Use other actions
+#   - Accept inputs and produce outputs
+#   - Be shared across workflows and repositories
+#
+# This workflow demonstrates how to USE composite actions from:
+#   - The same repository (local path reference)
+#   - Another repository (cow-lucian/custom-actions)
+#   - The GitHub Marketplace
+#
+# A composite action is referenced just like any other action, using the
+# `uses` keyword, and configured with `with` for inputs.
+# =============================================================================
+
+name: "05 - Composite Actions Usage"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Using a composite action from another repository
+  # ---------------------------------------------------------------------------
+  # Composite actions from other repos are referenced as:
+  #   uses: owner/repo/path@ref
+  # where path is the directory containing action.yml
+  # ---------------------------------------------------------------------------
+  use-external-composite:
+    name: "External Composite Action"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Use a composite action from cow-lucian/custom-actions
+      # This references the action defined at the root of the repo
+      # (or at a subdirectory path)
+      # -----------------------------------------------------------------------
+      - name: Setup project environment
+        # Format: owner/repo@ref (action.yml at repo root)
+        # Or:     owner/repo/path@ref (action.yml in subdirectory)
+        uses: cow-lucian/custom-actions/setup-node-project@v1
+        with:
+          # Inputs defined in the composite action's action.yml
+          node-version: "20"
+          package-manager: "npm"
+          install-dependencies: "true"
+
+      - name: Run linting with composite action
+        uses: cow-lucian/custom-actions/lint@v1
+        with:
+          config-path: ".eslintrc.json"
+          fix: "false"
+          fail-on-warnings: "true"
+
+      # -----------------------------------------------------------------------
+      # Use a composite action and capture its outputs
+      # -----------------------------------------------------------------------
+      - name: Run build with composite action
+        id: build
+        uses: cow-lucian/custom-actions/build@v1
+        with:
+          target: "production"
+          source-map: "true"
+          output-directory: "dist"
+
+      # Access outputs from the composite action
+      - name: Show build outputs
+        run: |
+          echo "Build status: ${{ steps.build.outputs.status }}"
+          echo "Build duration: ${{ steps.build.outputs.duration }}"
+          echo "Bundle size: ${{ steps.build.outputs.bundle-size }}"
+          echo "Output path: ${{ steps.build.outputs.output-path }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Using a local composite action from the same repo
+  # ---------------------------------------------------------------------------
+  # Local composite actions are referenced with a relative path:
+  #   uses: ./.github/actions/my-action
+  # The path must contain an action.yml file.
+  # ---------------------------------------------------------------------------
+  use-local-composite:
+    name: "Local Composite Action"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Use a composite action defined in this repository
+      # Expected file: .github/actions/setup-and-build/action.yml
+      # -----------------------------------------------------------------------
+      - name: Setup and build
+        id: local-build
+        uses: ./.github/actions/setup-and-build
+        with:
+          node-version: "20"
+          build-args: "--production"
+
+      - name: Show local action outputs
+        run: |
+          echo "Build succeeded: ${{ steps.local-build.outputs.success }}"
+          echo "Artifact path: ${{ steps.local-build.outputs.artifact-path }}"
+
+      # -----------------------------------------------------------------------
+      # Another local composite action for deployment prep
+      # Expected file: .github/actions/deploy-prep/action.yml
+      # -----------------------------------------------------------------------
+      - name: Prepare deployment
+        id: deploy-prep
+        uses: ./.github/actions/deploy-prep
+        with:
+          environment: "staging"
+          version: ${{ github.sha }}
+          config-file: "deploy.config.json"
+
+      - name: Show deployment info
+        run: |
+          echo "Deploy URL: ${{ steps.deploy-prep.outputs.deploy-url }}"
+          echo "Version tag: ${{ steps.deploy-prep.outputs.version-tag }}"
+          echo "Manifest: ${{ steps.deploy-prep.outputs.manifest-path }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Composite action with complex inputs and environment
+  # ---------------------------------------------------------------------------
+  complex-composite-usage:
+    name: "Complex Composite Usage"
+    runs-on: ubuntu-latest
+    # Environment variables available to all steps including composite actions
+    env:
+      APP_ENV: production
+      LOG_LEVEL: info
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Composite action with many input types
+      # -----------------------------------------------------------------------
+      - name: Run comprehensive checks
+        id: checks
+        uses: cow-lucian/custom-actions/comprehensive-check@v2
+        with:
+          # String inputs
+          project-name: "my-app"
+          environment: "staging"
+
+          # Boolean inputs (always passed as strings in GitHub Actions)
+          run-tests: "true"
+          run-lint: "true"
+          run-security-scan: "true"
+          fail-fast: "false"
+
+          # Number inputs (also strings)
+          timeout-minutes: "30"
+          retry-count: "3"
+
+          # Multi-line input
+          excluded-paths: |
+            node_modules/
+            dist/
+            .git/
+            coverage/
+
+          # JSON input
+          custom-config: '{"verbose": true, "parallel": 4}'
+        # Environment variables specific to this step
+        # These are available inside the composite action's steps
+        env:
+          CUSTOM_TOKEN: ${{ secrets.CUSTOM_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # -----------------------------------------------------------------------
+      # Use outputs from the composite action in subsequent steps
+      # -----------------------------------------------------------------------
+      - name: Process check results
+        if: always()
+        run: |
+          echo "=== Check Results ==="
+          echo "Tests passed: ${{ steps.checks.outputs.tests-passed }}"
+          echo "Lint passed: ${{ steps.checks.outputs.lint-passed }}"
+          echo "Security scan passed: ${{ steps.checks.outputs.security-passed }}"
+          echo "Overall status: ${{ steps.checks.outputs.overall-status }}"
+          echo "Report URL: ${{ steps.checks.outputs.report-url }}"
+
+          # Fail the job if overall status is not 'success'
+          if [ "${{ steps.checks.outputs.overall-status }}" != "success" ]; then
+            echo "::error::Checks failed. See report: ${{ steps.checks.outputs.report-url }}"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Chaining multiple composite actions
+  # ---------------------------------------------------------------------------
+  # Composite actions can be chained together, with each action's outputs
+  # feeding into the next action's inputs.
+  # ---------------------------------------------------------------------------
+  chained-composites:
+    name: "Chained Composite Actions"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 1: Setup
+      - name: Setup environment
+        id: setup
+        uses: cow-lucian/custom-actions/setup-node-project@v1
+        with:
+          node-version: "20"
+          package-manager: "npm"
+          install-dependencies: "true"
+
+      # Step 2: Build (uses output from setup)
+      - name: Build application
+        id: build
+        uses: cow-lucian/custom-actions/build@v1
+        with:
+          target: "production"
+          source-map: "false"
+          output-directory: "dist"
+
+      # Step 3: Test (uses outputs from both setup and build)
+      - name: Run tests
+        id: test
+        uses: cow-lucian/custom-actions/test@v1
+        with:
+          test-suite: "all"
+          coverage: "true"
+          coverage-threshold: "80"
+
+      # Step 4: Package (uses output from build)
+      - name: Package artifact
+        id: package
+        uses: cow-lucian/custom-actions/package@v1
+        with:
+          source-directory: ${{ steps.build.outputs.output-path }}
+          version: ${{ github.sha }}
+          format: "docker"
+
+      # Final summary using all outputs
+      - name: Pipeline summary
+        run: |
+          echo "## Pipeline Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | Status | Details |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|---------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Setup | ${{ steps.setup.outputs.status }} | Node ${{ steps.setup.outputs.node-version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build | ${{ steps.build.outputs.status }} | Duration: ${{ steps.build.outputs.duration }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test | ${{ steps.test.outputs.status }} | Coverage: ${{ steps.test.outputs.coverage-percentage }}% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Package | ${{ steps.package.outputs.status }} | Image: ${{ steps.package.outputs.image-tag }} |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Conditional composite action usage
+  # ---------------------------------------------------------------------------
+  conditional-composites:
+    name: "Conditional Composite Actions"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Only run the deployment action on main branch pushes
+      - name: Setup
+        uses: cow-lucian/custom-actions/setup-node-project@v1
+        with:
+          node-version: "20"
+          package-manager: "npm"
+          install-dependencies: "true"
+
+      - name: Build
+        id: build
+        uses: cow-lucian/custom-actions/build@v1
+        with:
+          target: ${{ github.ref == 'refs/heads/main' && 'production' || 'development' }}
+          source-map: ${{ github.ref == 'refs/heads/main' && 'false' || 'true' }}
+          output-directory: "dist"
+
+      # Conditional: only deploy from main branch
+      - name: Deploy
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: cow-lucian/custom-actions/deploy@v1
+        with:
+          artifact-path: ${{ steps.build.outputs.output-path }}
+          environment: "production"
+          notify-slack: "true"
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+      # Conditional: only run visual regression on PRs
+      - name: Visual regression test
+        if: github.event_name == 'pull_request'
+        uses: cow-lucian/custom-actions/visual-regression@v1
+        with:
+          base-branch: ${{ github.event.pull_request.base.ref }}
+          screenshots-dir: "tests/screenshots"
+          threshold: "0.1"
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Matrix + composite actions
+  # ---------------------------------------------------------------------------
+  matrix-composites:
+    name: "Build ${{ matrix.target }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [api, web, worker]
+        include:
+          - target: api
+            build-cmd: "build:api"
+            test-suite: "api"
+          - target: web
+            build-cmd: "build:web"
+            test-suite: "web"
+          - target: worker
+            build-cmd: "build:worker"
+            test-suite: "worker"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: cow-lucian/custom-actions/setup-node-project@v1
+        with:
+          node-version: "20"
+          package-manager: "npm"
+          install-dependencies: "true"
+
+      - name: Build target
+        id: build
+        uses: cow-lucian/custom-actions/build@v1
+        with:
+          target: ${{ matrix.target }}
+          output-directory: "dist/${{ matrix.target }}"
+
+      - name: Test target
+        uses: cow-lucian/custom-actions/test@v1
+        with:
+          test-suite: ${{ matrix.test-suite }}
+          coverage: "true"
+          coverage-threshold: "80"

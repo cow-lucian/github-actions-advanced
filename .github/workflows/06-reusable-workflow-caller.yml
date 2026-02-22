@@ -1,0 +1,329 @@
+# =============================================================================
+# 06 - Reusable Workflow Caller
+# =============================================================================
+# Reusable workflows allow you to define a workflow once and call it from
+# other workflows. Unlike composite actions, reusable workflows:
+#   - Run as complete jobs (not individual steps)
+#   - Can contain multiple jobs
+#   - Support secrets passing (inherit or explicit)
+#   - Can use environments and environment secrets
+#   - Have their own permissions scope
+#
+# Calling syntax:
+#   jobs:
+#     my-job:
+#       uses: owner/repo/.github/workflows/reusable.yml@ref
+#       with:
+#         input1: value1
+#       secrets:
+#         secret1: ${{ secrets.MY_SECRET }}
+#
+# This workflow demonstrates calling reusable workflows from
+# cow-lucian/reusable-workflows repository.
+# =============================================================================
+
+name: "06 - Reusable Workflow Caller"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: false
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      skip-tests:
+        description: "Skip test suite"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  # Additional permissions needed for reusable workflows
+  # The caller must have at least the permissions the callee needs
+  pull-requests: write
+  checks: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Basic reusable workflow call
+  # ---------------------------------------------------------------------------
+  # The simplest form: call a reusable workflow with inputs and secrets.
+  # The called workflow must have `on: workflow_call` as its trigger.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: "Lint"
+    # Reference format: owner/repo/.github/workflows/file.yml@ref
+    # @ref can be: branch name, tag, or full SHA (recommended for security)
+    uses: cow-lucian/reusable-workflows/.github/workflows/lint.yml@main
+    with:
+      # Inputs defined in the reusable workflow's workflow_call.inputs
+      node-version: "20"
+      working-directory: "."
+      config-path: ".eslintrc.json"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Passing secrets explicitly
+  # ---------------------------------------------------------------------------
+  # Secrets can be passed one-by-one. The reusable workflow defines which
+  # secrets it accepts in workflow_call.secrets.
+  # ---------------------------------------------------------------------------
+  test:
+    name: "Test"
+    uses: cow-lucian/reusable-workflows/.github/workflows/test.yml@main
+    with:
+      node-version: "20"
+      coverage: true
+      coverage-threshold: 80
+    # Pass specific secrets to the reusable workflow
+    secrets:
+      # The reusable workflow references these as ${{ secrets.CODECOV_TOKEN }}
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Inheriting ALL secrets
+  # ---------------------------------------------------------------------------
+  # Instead of passing secrets one by one, you can use `secrets: inherit`
+  # to pass ALL secrets from the caller to the callee. This is convenient
+  # but less explicit about which secrets are used.
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build"
+    needs: [lint, test]
+    uses: cow-lucian/reusable-workflows/.github/workflows/build.yml@main
+    with:
+      node-version: "20"
+      target: "production"
+      source-maps: false
+    # Inherit ALL secrets from the calling workflow
+    # The reusable workflow can access any secret the caller has access to
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Using outputs from a reusable workflow
+  # ---------------------------------------------------------------------------
+  # Reusable workflows can produce outputs, which the caller can use in
+  # subsequent jobs via needs.<job-id>.outputs.<output-name>.
+  # ---------------------------------------------------------------------------
+  version:
+    name: "Determine Version"
+    uses: cow-lucian/reusable-workflows/.github/workflows/version.yml@main
+    with:
+      strategy: "semver"
+      pre-release: ${{ github.event_name == 'pull_request' }}
+
+  # Use the outputs from the version job
+  tag-and-release:
+    name: "Tag and Release"
+    needs: [build, version]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show version outputs
+        run: |
+          echo "Version: ${{ needs.version.outputs.version }}"
+          echo "Tag: ${{ needs.version.outputs.tag }}"
+          echo "Is pre-release: ${{ needs.version.outputs.is-prerelease }}"
+          echo "Changelog: ${{ needs.version.outputs.changelog }}"
+
+      - name: Create release
+        run: |
+          echo "Would create release ${{ needs.version.outputs.tag }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Conditional reusable workflow calls
+  # ---------------------------------------------------------------------------
+  # You can use `if` conditions on reusable workflow jobs just like
+  # regular jobs.
+  # ---------------------------------------------------------------------------
+
+  # Only deploy from main branch pushes
+  deploy-staging:
+    name: "Deploy to Staging"
+    needs: [build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    uses: cow-lucian/reusable-workflows/.github/workflows/deploy.yml@main
+    with:
+      environment: "staging"
+      version: ${{ github.sha }}
+      health-check-url: "https://staging.example.com/health"
+      health-check-timeout: 120
+    secrets:
+      DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.STAGING_AWS_ROLE_ARN }}
+
+  # Deploy to production only on manual trigger with production selected
+  deploy-production:
+    name: "Deploy to Production"
+    needs: [deploy-staging]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.environment == 'production'
+    uses: cow-lucian/reusable-workflows/.github/workflows/deploy.yml@main
+    with:
+      environment: "production"
+      version: ${{ github.sha }}
+      health-check-url: "https://example.com/health"
+      health-check-timeout: 300
+    secrets:
+      DEPLOY_KEY: ${{ secrets.PRODUCTION_DEPLOY_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.PRODUCTION_AWS_ROLE_ARN }}
+
+  # Only run security scan on PRs
+  security-scan:
+    name: "Security Scan"
+    if: github.event_name == 'pull_request'
+    uses: cow-lucian/reusable-workflows/.github/workflows/security-scan.yml@main
+    with:
+      scan-type: "full"
+      fail-on-severity: "high"
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Multiple reusable workflows in parallel
+  # ---------------------------------------------------------------------------
+  # Jobs without `needs` dependencies run in parallel by default.
+  # These three scan workflows run simultaneously.
+  # ---------------------------------------------------------------------------
+
+  # These three jobs all run in parallel (no needs dependency on each other)
+  sast-scan:
+    name: "SAST Scan"
+    uses: cow-lucian/reusable-workflows/.github/workflows/sast.yml@main
+    with:
+      language: "javascript"
+      severity-threshold: "medium"
+    secrets: inherit
+
+  dependency-scan:
+    name: "Dependency Scan"
+    uses: cow-lucian/reusable-workflows/.github/workflows/dependency-scan.yml@main
+    with:
+      lockfile-path: "package-lock.json"
+      fail-on-vulnerability: true
+    secrets: inherit
+
+  container-scan:
+    name: "Container Scan"
+    uses: cow-lucian/reusable-workflows/.github/workflows/container-scan.yml@main
+    with:
+      dockerfile-path: "Dockerfile"
+      severity-threshold: "high"
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Sequential reusable workflows with data passing
+  # ---------------------------------------------------------------------------
+  # Chain reusable workflows where each depends on the previous one's outputs.
+  # This creates a pipeline: validate → build → test → deploy
+  # ---------------------------------------------------------------------------
+
+  # Step 1: Validate
+  pipeline-validate:
+    name: "Pipeline: Validate"
+    uses: cow-lucian/reusable-workflows/.github/workflows/validate.yml@main
+    with:
+      strict-mode: true
+
+  # Step 2: Build (depends on validate)
+  pipeline-build:
+    name: "Pipeline: Build"
+    needs: [pipeline-validate]
+    uses: cow-lucian/reusable-workflows/.github/workflows/build.yml@main
+    with:
+      node-version: "20"
+      target: "production"
+      source-maps: false
+    secrets: inherit
+
+  # Step 3: Integration test (depends on build, uses build outputs)
+  pipeline-test:
+    name: "Pipeline: Integration Test"
+    needs: [pipeline-build]
+    uses: cow-lucian/reusable-workflows/.github/workflows/integration-test.yml@main
+    with:
+      artifact-name: ${{ needs.pipeline-build.outputs.artifact-name }}
+      test-suite: "integration"
+    secrets: inherit
+
+  # Step 4: Deploy (depends on all previous steps)
+  pipeline-deploy:
+    name: "Pipeline: Deploy"
+    needs: [pipeline-validate, pipeline-build, pipeline-test]
+    if: github.ref == 'refs/heads/main'
+    uses: cow-lucian/reusable-workflows/.github/workflows/deploy.yml@main
+    with:
+      environment: "staging"
+      version: ${{ needs.pipeline-build.outputs.version }}
+      health-check-url: "https://staging.example.com/health"
+      health-check-timeout: 120
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Job 8: Reusable workflow with matrix
+  # ---------------------------------------------------------------------------
+  # You can use matrix strategy with reusable workflow calls.
+  # Each matrix combination calls the reusable workflow with different inputs.
+  # ---------------------------------------------------------------------------
+  multi-platform-build:
+    name: "Build (${{ matrix.platform }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux, macos, windows]
+        include:
+          - platform: linux
+            runner: ubuntu-latest
+          - platform: macos
+            runner: macos-latest
+          - platform: windows
+            runner: windows-latest
+    uses: cow-lucian/reusable-workflows/.github/workflows/platform-build.yml@main
+    with:
+      platform: ${{ matrix.platform }}
+      runner: ${{ matrix.runner }}
+      node-version: "20"
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Summary job: aggregate results from all reusable workflow calls
+  # ---------------------------------------------------------------------------
+  summary:
+    name: "Pipeline Summary"
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - lint
+      - test
+      - build
+      - sast-scan
+      - dependency-scan
+      - container-scan
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Pipeline Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Lint | ${{ needs.lint.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test | ${{ needs.test.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build | ${{ needs.build.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SAST Scan | ${{ needs.sast-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dependency Scan | ${{ needs.dependency-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Container Scan | ${{ needs.container-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check for failures
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::One or more pipeline jobs failed"
+          exit 1
