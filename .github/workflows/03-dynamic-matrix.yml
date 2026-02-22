@@ -1,0 +1,450 @@
+# =============================================================================
+# 03 - Dynamic Matrix Generation
+# =============================================================================
+# Static matrices are defined directly in the workflow file, but sometimes
+# you need to generate the matrix dynamically based on:
+#   - Files that changed in a PR
+#   - API responses
+#   - Configuration files
+#   - Computed logic
+#
+# Key technique: use fromJSON() to parse a JSON string into a matrix object.
+# A setup job can output JSON, and subsequent jobs use fromJSON() on that
+# output to create the matrix.
+# =============================================================================
+
+name: "03 - Dynamic Matrix"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environments:
+        description: "Comma-separated list of environments to deploy"
+        required: false
+        default: "staging"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Generate matrix dynamically from a setup job
+  # ---------------------------------------------------------------------------
+  # This is the most common pattern: one job computes the matrix, and a
+  # subsequent job uses it via fromJSON().
+  # ---------------------------------------------------------------------------
+  generate-matrix:
+    name: "Generate Matrix"
+    runs-on: ubuntu-latest
+    outputs:
+      # Output the matrix JSON so downstream jobs can use it
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      # Also output whether the matrix is empty (useful for conditionals)
+      has-items: ${{ steps.set-matrix.outputs.has-items }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine matrix
+        id: set-matrix
+        run: |
+          # Build the matrix JSON dynamically
+          # This could be based on any logic: file changes, config files, etc.
+          
+          MATRIX_JSON='{"include":['
+          FIRST=true
+
+          # Example: detect which packages have changes
+          # In practice, you'd compare against the base branch
+          for dir in packages/*/; do
+            if [ -d "$dir" ]; then
+              PACKAGE_NAME=$(basename "$dir")
+              if [ "$FIRST" = true ]; then
+                FIRST=false
+              else
+                MATRIX_JSON+=','
+              fi
+              # Each matrix entry can have multiple properties
+              MATRIX_JSON+="{\"package\":\"${PACKAGE_NAME}\",\"directory\":\"${dir}\"}"
+            fi
+          done
+
+          MATRIX_JSON+=']}'
+
+          # Fallback if no packages found - use a default matrix
+          if [ "$FIRST" = true ]; then
+            MATRIX_JSON='{"include":[{"package":"app","directory":"src/"}]}'
+            echo "has-items=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-items=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+          echo "Generated matrix: ${MATRIX_JSON}"
+
+  # Use the dynamic matrix
+  build-packages:
+    name: "Build ${{ matrix.package }}"
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.has-items == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Parse the JSON string into a matrix object
+      matrix: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          echo "Building package: ${{ matrix.package }}"
+          echo "Directory: ${{ matrix.directory }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Matrix from a configuration file
+  # ---------------------------------------------------------------------------
+  # Read the matrix from a JSON or YAML file in the repository. This makes
+  # it easy to update the matrix without editing the workflow.
+  # ---------------------------------------------------------------------------
+  read-matrix-file:
+    name: "Read Matrix from File"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read-file.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read matrix configuration file
+        id: read-file
+        run: |
+          # Option A: Read from a JSON file
+          # Expected format of .github/matrix-config.json:
+          # {
+          #   "node-version": ["18", "20", "22"],
+          #   "os": ["ubuntu-latest", "macos-latest"],
+          #   "include": [
+          #     { "node-version": "20", "os": "windows-latest" }
+          #   ],
+          #   "exclude": [
+          #     { "node-version": "18", "os": "macos-latest" }
+          #   ]
+          # }
+
+          if [ -f ".github/matrix-config.json" ]; then
+            # Read and compact the JSON (remove newlines for output)
+            MATRIX=$(jq -c '.' .github/matrix-config.json)
+          else
+            # Fallback default matrix
+            MATRIX='{"node-version":["18","20","22"],"os":["ubuntu-latest"]}'
+          fi
+
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: ${MATRIX}"
+
+  build-from-file:
+    name: "Build (Node ${{ matrix.node-version }}, ${{ matrix.os }})"
+    needs: read-matrix-file
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix: ${{ fromJSON(needs.read-matrix-file.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Build and test
+        run: |
+          echo "Node: $(node --version)"
+          echo "OS: ${{ matrix.os }}"
+          npm ci && npm test
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Conditional matrix entries
+  # ---------------------------------------------------------------------------
+  # Generate different matrix configurations based on the trigger event,
+  # branch, or other conditions.
+  # ---------------------------------------------------------------------------
+  conditional-matrix:
+    name: "Generate Conditional Matrix"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build conditional matrix
+        id: set-matrix
+        run: |
+          # Minimal matrix for PRs, full matrix for main branch pushes
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: test only the latest Node version on Ubuntu
+            MATRIX='{
+              "node-version": ["20"],
+              "os": ["ubuntu-latest"]
+            }'
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            # Main branch: full matrix
+            MATRIX='{
+              "node-version": ["18", "20", "22"],
+              "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+              "exclude": [
+                {"node-version": "18", "os": "windows-latest"}
+              ]
+            }'
+          else
+            # Other branches: moderate matrix
+            MATRIX='{
+              "node-version": ["18", "20"],
+              "os": ["ubuntu-latest"]
+            }'
+          fi
+
+          # Compact the JSON (remove newlines and extra spaces)
+          MATRIX=$(echo "$MATRIX" | jq -c '.')
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "Matrix: ${MATRIX}"
+
+  conditional-build:
+    name: "Node ${{ matrix.node-version }} / ${{ matrix.os }}"
+    needs: conditional-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix: ${{ fromJSON(needs.conditional-matrix.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Test
+        run: |
+          node --version
+          npm ci && npm test
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Matrix from API response
+  # ---------------------------------------------------------------------------
+  # Fetch data from an API and use it to build the matrix. Useful for
+  # testing against dynamic targets (e.g., active deployments, supported
+  # versions from a registry).
+  # ---------------------------------------------------------------------------
+  api-matrix:
+    name: "Matrix from API"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.fetch-versions.outputs.matrix }}
+    steps:
+      - name: Fetch supported versions from API
+        id: fetch-versions
+        run: |
+          # Example: Fetch Node.js LTS versions from the official API
+          # and build a matrix from them
+          VERSIONS=$(curl -sf https://nodejs.org/dist/index.json | \
+            jq -c '[
+              .[]
+              | select(.lts != false)
+              | .version
+              | ltrimstr("v")
+              | split(".")[0]
+            ] | unique | sort | .[-3:]')
+
+          # Result might be: ["18","20","22"]
+          echo "Active LTS versions: ${VERSIONS}"
+
+          MATRIX=$(jq -n -c \
+            --argjson versions "$VERSIONS" \
+            '{"node-version": $versions, "os": ["ubuntu-latest"]}')
+
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: ${MATRIX}"
+
+  api-build:
+    name: "API Matrix - Node ${{ matrix.node-version }}"
+    needs: api-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix: ${{ fromJSON(needs.api-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Test
+        run: |
+          echo "Testing against Node.js $(node --version)"
+          npm ci && npm test
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Reusable matrix generation pattern
+  # ---------------------------------------------------------------------------
+  # A pattern that combines multiple matrix sources and applies filtering.
+  # This is useful for monorepos where you want to test only changed packages
+  # but with different configurations per package.
+  # ---------------------------------------------------------------------------
+  smart-matrix:
+    name: "Smart Matrix Generation"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      empty: ${{ steps.build-matrix.outputs.empty }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff detection
+
+      - name: Build smart matrix
+        id: build-matrix
+        run: |
+          # Detect changed files (compare against base or previous commit)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+          fi
+
+          # If BASE_SHA is empty (first push), use empty tree
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            BASE_SHA=$(git hash-object -t tree /dev/null)
+          fi
+
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD 2>/dev/null || echo "")
+
+          # Define package configurations
+          # Each package can have its own test matrix settings
+          declare -A PACKAGE_CONFIG
+          PACKAGE_CONFIG[api]='{"node-version":["18","20"],"test-cmd":"npm run test:api"}'
+          PACKAGE_CONFIG[web]='{"node-version":["20"],"test-cmd":"npm run test:web"}'
+          PACKAGE_CONFIG[shared]='{"node-version":["18","20"],"test-cmd":"npm run test:shared"}'
+
+          # Build matrix entries for changed packages
+          INCLUDE_ENTRIES=""
+          for pkg in api web shared; do
+            # Check if any files in this package changed
+            if echo "$CHANGED_FILES" | grep -q "^packages/${pkg}/"; then
+              CONFIG=$(echo "${PACKAGE_CONFIG[$pkg]}" | jq -c '.')
+              NODE_VERSIONS=$(echo "$CONFIG" | jq -r '.["node-version"][]')
+              TEST_CMD=$(echo "$CONFIG" | jq -r '.["test-cmd"]')
+
+              for ver in $NODE_VERSIONS; do
+                ENTRY="{\"package\":\"${pkg}\",\"node-version\":\"${ver}\",\"test-cmd\":\"${TEST_CMD}\"}"
+                if [ -n "$INCLUDE_ENTRIES" ]; then
+                  INCLUDE_ENTRIES="${INCLUDE_ENTRIES},${ENTRY}"
+                else
+                  INCLUDE_ENTRIES="${ENTRY}"
+                fi
+              done
+            fi
+          done
+
+          if [ -z "$INCLUDE_ENTRIES" ]; then
+            echo "No packages changed, using minimal matrix"
+            MATRIX='{"include":[{"package":"app","node-version":"20","test-cmd":"npm test"}]}'
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          else
+            MATRIX="{\"include\":[${INCLUDE_ENTRIES}]}"
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Generated matrix:"
+          echo "$MATRIX" | jq '.'
+
+  smart-test:
+    name: "Test ${{ matrix.package }} (Node ${{ matrix.node-version }})"
+    needs: smart-matrix
+    if: needs.smart-matrix.outputs.empty != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.smart-matrix.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install and test
+        run: |
+          echo "Testing package: ${{ matrix.package }}"
+          echo "Node version: ${{ matrix.node-version }}"
+          echo "Test command: ${{ matrix.test-cmd }}"
+          npm ci
+          ${{ matrix.test-cmd }}
+        working-directory: packages/${{ matrix.package }}
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Matrix with max-parallel and complex include
+  # ---------------------------------------------------------------------------
+  complex-matrix:
+    name: "Complex Matrix"
+    runs-on: ubuntu-latest
+    strategy:
+      # Limit concurrent jobs to avoid resource exhaustion
+      max-parallel: 4
+      fail-fast: false
+      matrix:
+        # Base matrix dimensions
+        target: [api, web, mobile]
+        environment: [staging, production]
+        # Include additional properties for specific combinations
+        include:
+          # API-specific settings
+          - target: api
+            environment: staging
+            deploy-url: "https://staging-api.example.com"
+            replicas: 1
+          - target: api
+            environment: production
+            deploy-url: "https://api.example.com"
+            replicas: 3
+          # Web-specific settings
+          - target: web
+            environment: staging
+            deploy-url: "https://staging.example.com"
+            cdn: false
+          - target: web
+            environment: production
+            deploy-url: "https://www.example.com"
+            cdn: true
+          # Add an extra combination not in the base dimensions
+          - target: api
+            environment: canary
+            deploy-url: "https://canary-api.example.com"
+            replicas: 1
+        # Remove combinations that don't make sense
+        exclude:
+          - target: mobile
+            environment: staging
+
+    steps:
+      - name: Show matrix values
+        run: |
+          echo "Target: ${{ matrix.target }}"
+          echo "Environment: ${{ matrix.environment }}"
+          echo "Deploy URL: ${{ matrix.deploy-url }}"
+          echo "Replicas: ${{ matrix.replicas }}"
+          echo "CDN: ${{ matrix.cdn }}"

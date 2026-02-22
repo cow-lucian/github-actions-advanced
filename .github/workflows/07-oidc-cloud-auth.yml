@@ -1,0 +1,394 @@
+# =============================================================================
+# 07 - OIDC Cloud Authentication
+# =============================================================================
+# OpenID Connect (OIDC) allows GitHub Actions workflows to authenticate with
+# cloud providers WITHOUT storing long-lived credentials as secrets.
+#
+# How it works:
+#   1. GitHub Actions generates a short-lived JWT (OIDC token) for each
+#      workflow run. This token includes claims about the repo, branch,
+#      workflow, and job.
+#   2. Your cloud provider is configured to trust GitHub's OIDC provider
+#      (token.actions.githubusercontent.com).
+#   3. The workflow exchanges the GitHub OIDC token for short-lived cloud
+#      credentials using the cloud provider's STS (Security Token Service).
+#
+# Benefits:
+#   - No long-lived secrets to rotate
+#   - Credentials are scoped to a single workflow run
+#   - Fine-grained trust policies (restrict by repo, branch, environment)
+#   - Audit trail of which workflow run used which credentials
+#
+# TRUST RELATIONSHIP SETUP:
+#   You MUST configure the cloud provider to trust GitHub's OIDC tokens
+#   before these workflows will work. See comments in each section below.
+#
+# REQUIRED PERMISSION:
+#   The workflow MUST request `id-token: write` permission to get OIDC tokens.
+# =============================================================================
+
+name: "07 - OIDC Cloud Authentication"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# =============================================================================
+# CRITICAL: id-token: write is REQUIRED for OIDC
+# Without this, the workflow cannot request OIDC tokens from GitHub
+# =============================================================================
+permissions:
+  id-token: write    # Required for OIDC token generation
+  contents: read     # Required to checkout code
+
+jobs:
+  # ===========================================================================
+  # AWS Authentication using OIDC
+  # ===========================================================================
+  # TRUST SETUP FOR AWS:
+  #   1. Go to AWS IAM Console → Identity Providers → Add Provider
+  #   2. Provider Type: OpenID Connect
+  #   3. Provider URL: https://token.actions.githubusercontent.com
+  #   4. Audience: sts.amazonaws.com
+  #   5. Create an IAM Role with the following trust policy:
+  #      {
+  #        "Version": "2012-10-17",
+  #        "Statement": [
+  #          {
+  #            "Effect": "Allow",
+  #            "Principal": {
+  #              "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+  #            },
+  #            "Action": "sts:AssumeRoleWithWebIdentity",
+  #            "Condition": {
+  #              "StringEquals": {
+  #                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+  #              },
+  #              "StringLike": {
+  #                "token.actions.githubusercontent.com:sub": "repo:cow-lucian/github-actions-advanced:*"
+  #              }
+  #            }
+  #          }
+  #        ]
+  #      }
+  #
+  #   You can restrict further:
+  #     - Specific branch: "repo:cow-lucian/github-actions-advanced:ref:refs/heads/main"
+  #     - Specific environment: "repo:cow-lucian/github-actions-advanced:environment:production"
+  #     - Pull requests: "repo:cow-lucian/github-actions-advanced:pull_request"
+  #
+  #   6. Attach IAM policies to the role for the permissions you need
+  #      (e.g., S3 read/write, ECR push, ECS deploy, etc.)
+  # ===========================================================================
+
+  # NOTE: This job is commented out because it requires actual AWS configuration.
+  # Uncomment and fill in your role ARN to use it.
+
+  # aws-deploy:
+  #   name: "AWS - Deploy with OIDC"
+  #   runs-on: ubuntu-latest
+  #   # Optionally use an environment for additional protection
+  #   # (requires environment-specific trust policy in AWS)
+  #   environment:
+  #     name: production
+  #     url: https://example.com
+  #
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     # Configure AWS credentials using OIDC
+  #     # This action handles the token exchange automatically
+  #     - name: Configure AWS Credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         # The IAM role ARN you created with the trust policy above
+  #         role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsDeployRole
+  #         # The AWS region to use
+  #         aws-region: us-east-1
+  #         # Optional: session name for CloudTrail audit logging
+  #         role-session-name: github-actions-${{ github.run_id }}
+  #         # Optional: duration (default 1 hour, max depends on role config)
+  #         role-duration-seconds: 900
+  #         # Optional: inline session policy to further restrict permissions
+  #         # inline-session-policy: |
+  #         #   {
+  #         #     "Version": "2012-10-17",
+  #         #     "Statement": [
+  #         #       {
+  #         #         "Effect": "Allow",
+  #         #         "Action": ["s3:PutObject"],
+  #         #         "Resource": "arn:aws:s3:::my-deploy-bucket/*"
+  #         #       }
+  #         #     ]
+  #         #   }
+  #
+  #     # Now you can use AWS CLI/SDK as if you had credentials configured
+  #     - name: Verify identity
+  #       run: |
+  #         aws sts get-caller-identity
+  #         echo "Successfully authenticated with OIDC!"
+  #
+  #     - name: Deploy to S3
+  #       run: |
+  #         aws s3 sync ./dist s3://my-deploy-bucket/ --delete
+  #
+  #     - name: Deploy to ECS
+  #       run: |
+  #         aws ecs update-service \
+  #           --cluster my-cluster \
+  #           --service my-service \
+  #           --force-new-deployment
+  #
+  #     - name: Push to ECR
+  #       run: |
+  #         # Login to ECR
+  #         aws ecr get-login-password --region us-east-1 | \
+  #           docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  #
+  #         # Build and push
+  #         docker build -t my-app .
+  #         docker tag my-app:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:${{ github.sha }}
+  #         docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:${{ github.sha }}
+
+  # ===========================================================================
+  # GCP Authentication using OIDC
+  # ===========================================================================
+  # TRUST SETUP FOR GCP:
+  #   1. Create a Workload Identity Pool:
+  #      gcloud iam workload-identity-pools create "github-actions" \
+  #        --project="my-project" \
+  #        --location="global" \
+  #        --display-name="GitHub Actions"
+  #
+  #   2. Create a Workload Identity Provider in the pool:
+  #      gcloud iam workload-identity-pools providers create-oidc "github" \
+  #        --project="my-project" \
+  #        --location="global" \
+  #        --workload-identity-pool="github-actions" \
+  #        --display-name="GitHub" \
+  #        --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository" \
+  #        --issuer-uri="https://token.actions.githubusercontent.com"
+  #
+  #   3. Grant the principal access to a service account:
+  #      gcloud iam service-accounts add-iam-policy-binding \
+  #        "my-sa@my-project.iam.gserviceaccount.com" \
+  #        --project="my-project" \
+  #        --role="roles/iam.workloadIdentityUser" \
+  #        --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions/attribute.repository/cow-lucian/github-actions-advanced"
+  #
+  #   You can restrict by branch, environment, etc. using attribute conditions.
+  # ===========================================================================
+
+  # gcp-deploy:
+  #   name: "GCP - Deploy with OIDC"
+  #   runs-on: ubuntu-latest
+  #
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     # Authenticate to GCP using OIDC
+  #     - name: Authenticate to Google Cloud
+  #       id: auth
+  #       uses: google-github-actions/auth@v2
+  #       with:
+  #         # The Workload Identity Provider resource name
+  #         workload_identity_provider: "projects/123456789/locations/global/workloadIdentityPools/github-actions/providers/github"
+  #         # The service account to impersonate
+  #         service_account: "my-sa@my-project.iam.gserviceaccount.com"
+  #         # Optional: token lifetime (default 1 hour)
+  #         token_format: "access_token"
+  #         # Optional: export to environment variables
+  #         export_environment_variables: true
+  #
+  #     # Setup gcloud CLI (uses the credentials from the auth step)
+  #     - name: Setup Google Cloud SDK
+  #       uses: google-github-actions/setup-gcloud@v2
+  #       with:
+  #         project_id: "my-project"
+  #
+  #     - name: Verify identity
+  #       run: |
+  #         gcloud auth list
+  #         gcloud config get-value project
+  #
+  #     - name: Deploy to Cloud Run
+  #       run: |
+  #         gcloud run deploy my-service \
+  #           --image gcr.io/my-project/my-app:${{ github.sha }} \
+  #           --region us-central1 \
+  #           --platform managed
+  #
+  #     - name: Deploy to GKE
+  #       run: |
+  #         gcloud container clusters get-credentials my-cluster \
+  #           --zone us-central1-a
+  #         kubectl apply -f k8s/
+
+  # ===========================================================================
+  # Azure Authentication using OIDC
+  # ===========================================================================
+  # TRUST SETUP FOR AZURE:
+  #   1. Register an application in Azure Active Directory (Entra ID)
+  #
+  #   2. Create a federated credential:
+  #      az ad app federated-credential create \
+  #        --id <APPLICATION_OBJECT_ID> \
+  #        --parameters '{
+  #          "name": "github-actions-main",
+  #          "issuer": "https://token.actions.githubusercontent.com",
+  #          "subject": "repo:cow-lucian/github-actions-advanced:ref:refs/heads/main",
+  #          "audiences": ["api://AzureADTokenExchange"]
+  #        }'
+  #
+  #   3. Subject formats:
+  #      - Branch:      repo:owner/repo:ref:refs/heads/main
+  #      - Tag:         repo:owner/repo:ref:refs/tags/v1.0.0
+  #      - Environment: repo:owner/repo:environment:production
+  #      - Pull request: repo:owner/repo:pull_request
+  #
+  #   4. Assign RBAC roles to the app (e.g., Contributor on a resource group)
+  # ===========================================================================
+
+  # azure-deploy:
+  #   name: "Azure - Deploy with OIDC"
+  #   runs-on: ubuntu-latest
+  #
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     # Authenticate to Azure using OIDC
+  #     - name: Azure Login
+  #       uses: azure/login@v2
+  #       with:
+  #         # From Azure App Registration
+  #         client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  #         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  #         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  #         # These are NOT secret credentials - they're just identifiers
+  #         # The actual authentication uses OIDC (no client secret needed!)
+  #
+  #     - name: Verify identity
+  #       run: |
+  #         az account show
+  #         az group list --output table
+  #
+  #     - name: Deploy to Azure Web App
+  #       uses: azure/webapps-deploy@v3
+  #       with:
+  #         app-name: "my-web-app"
+  #         package: "./dist"
+  #
+  #     - name: Deploy to AKS
+  #       run: |
+  #         az aks get-credentials --resource-group my-rg --name my-cluster
+  #         kubectl apply -f k8s/
+
+  # ===========================================================================
+  # Demonstration job (actually runs) - shows OIDC token claims
+  # ===========================================================================
+  show-oidc-claims:
+    name: "Show OIDC Token Claims"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get OIDC token and show claims
+        run: |
+          # Request an OIDC token from GitHub
+          # This requires id-token: write permission
+          OIDC_TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://example.com" \
+            | jq -r '.value')
+
+          if [ "$OIDC_TOKEN" = "null" ] || [ -z "$OIDC_TOKEN" ]; then
+            echo "::warning::Could not retrieve OIDC token. This is expected in some contexts (e.g., forks, PRs from forks)."
+            exit 0
+          fi
+
+          # Decode the JWT payload (middle section) - DO NOT log the full token!
+          echo "=== OIDC Token Claims ==="
+          echo "$OIDC_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '{
+            iss: .iss,
+            sub: .sub,
+            aud: .aud,
+            ref: .ref,
+            sha: .sha,
+            repository: .repository,
+            repository_owner: .repository_owner,
+            actor: .actor,
+            workflow: .workflow,
+            event_name: .event_name,
+            ref_type: .ref_type,
+            job_workflow_ref: .job_workflow_ref,
+            runner_environment: .runner_environment,
+            iat: (.iat | todate),
+            exp: (.exp | todate)
+          }' || echo "Could not decode token claims"
+
+          echo ""
+          echo "=== Key Points ==="
+          echo "- 'sub' claim is used by cloud providers to validate trust"
+          echo "- 'repository' claim identifies which repo the token is for"
+          echo "- 'ref' claim identifies the branch/tag"
+          echo "- Token is short-lived (check iat/exp)"
+        env:
+          # These environment variables are automatically set when
+          # id-token: write permission is granted
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+
+  # ===========================================================================
+  # Multi-cloud deployment pattern
+  # ===========================================================================
+  # A realistic pattern where you deploy to multiple clouds in sequence.
+  # Each cloud provider gets its own job with OIDC authentication.
+  # ===========================================================================
+
+  # multi-cloud-deploy:
+  #   name: "Multi-Cloud Deploy"
+  #   runs-on: ubuntu-latest
+  #   environment: production
+  #
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     # Authenticate to AWS
+  #     - name: Configure AWS Credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+  #         aws-region: us-east-1
+  #
+  #     - name: Deploy to AWS
+  #       run: |
+  #         aws s3 sync ./dist s3://my-bucket/
+  #
+  #     # Authenticate to GCP (can authenticate to multiple clouds in one job)
+  #     - name: Authenticate to GCP
+  #       uses: google-github-actions/auth@v2
+  #       with:
+  #         workload_identity_provider: "projects/123/locations/global/workloadIdentityPools/github/providers/github"
+  #         service_account: "deploy@my-project.iam.gserviceaccount.com"
+  #
+  #     - name: Deploy to GCP
+  #       run: |
+  #         gcloud run deploy my-service --image gcr.io/my-project/my-app:${{ github.sha }}
+  #
+  #     # Authenticate to Azure
+  #     - name: Azure Login
+  #       uses: azure/login@v2
+  #       with:
+  #         client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  #         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  #         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  #
+  #     - name: Deploy to Azure
+  #       run: |
+  #         az webapp deploy --resource-group my-rg --name my-app --src-path ./dist
