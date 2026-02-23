@@ -1,0 +1,433 @@
+# =============================================================================
+# 12 - Custom Webhooks & Event-Driven Patterns
+# =============================================================================
+# SCHOLAR NOTE:
+#   This workflow demonstrates advanced event-driven architecture patterns:
+#
+#   1. External webhook integration (Stripe, Slack, PagerDuty)
+#   2. Event filtering and routing
+#   3. Idempotency patterns for webhook handling
+#   4. Event replay and dead letter queues
+#   5. Multi-repo event choreography
+#   6. Custom webhook servers using GitHub Actions
+#
+# EVENT-DRIVEN ARCHITECTURE IN GITHUB ACTIONS:
+#
+#   External System          GitHub                    Your Workflows
+#   +-----------+     repository_dispatch      +------------------+
+#   | Stripe    |----POST /repos/.../dispatches--->| handle-payment |
+#   +-----------+                              +------------------+
+#   +-----------+     repository_dispatch      +------------------+
+#   | PagerDuty |----POST /repos/.../dispatches--->| handle-incident|
+#   +-----------+                              +------------------+
+#   +-----------+     repository_dispatch      +------------------+
+#   | Slack Bot |----POST /repos/.../dispatches--->| handle-command |
+#   +-----------+                              +------------------+
+#   +-----------+           Webhook            +------------------+
+#   | GitHub App|----webhook event---------------->| handle-event   |
+#   +-----------+                              +------------------+
+# =============================================================================
+
+name: "12 - Custom Webhooks & Events"
+
+on:
+  repository_dispatch:
+    types:
+      # Payment processing
+      - payment-received
+      - payment-failed
+      - subscription-changed
+      # Monitoring & alerts
+      - alert-triggered
+      - alert-resolved
+      - health-check-failed
+      # ChatOps
+      - slack-command
+      - teams-command
+      # Infrastructure
+      - terraform-apply-requested
+      - dns-change-requested
+      - certificate-expiring
+      # Data pipeline
+      - data-import-ready
+      - etl-completed
+      - report-generated
+
+  workflow_dispatch:
+    inputs:
+      demo:
+        description: "Which pattern to demonstrate"
+        type: choice
+        options:
+          - webhook-integration
+          - event-routing
+          - idempotency
+          - all
+        default: all
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Webhook Integration Patterns
+  # ---------------------------------------------------------------------------
+  # Shows how external systems can trigger GitHub Actions workflows
+  # using repository_dispatch.
+  # ---------------------------------------------------------------------------
+  webhook-patterns:
+    name: "Webhook Integration Patterns"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.demo == 'webhook-integration' || inputs.demo == 'all')
+    steps:
+      - name: "Document webhook integration patterns"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          # External Webhook Integration Patterns
+
+          ## Pattern 1: Stripe Payment Webhook -> GitHub Actions
+
+          ### Middleware Server (Node.js)
+          ```javascript
+          // This server receives Stripe webhooks and forwards to GitHub Actions
+          const express = require('express');
+          const crypto = require('crypto');
+          const app = express();
+
+          app.post('/stripe-webhook', express.raw({type: 'application/json'}), async (req, res) => {
+            // 1. Verify Stripe signature
+            const sig = req.headers['stripe-signature'];
+            const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+
+            // 2. Forward to GitHub Actions via repository_dispatch
+            await fetch('https://api.github.com/repos/org/repo/dispatches', {
+              method: 'POST',
+              headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github+json',
+              },
+              body: JSON.stringify({
+                event_type: `payment-${event.type}`,
+                client_payload: {
+                  stripe_event_id: event.id,
+                  type: event.type,
+                  amount: event.data.object.amount,
+                  customer: event.data.object.customer,
+                  timestamp: new Date().toISOString(),
+                  // Include idempotency key for deduplication
+                  idempotency_key: event.id,
+                },
+              }),
+            });
+
+            res.json({ received: true });
+          });
+          ```
+
+          ## Pattern 2: PagerDuty -> GitHub Actions
+
+          ### PagerDuty Webhook (v3)
+          ```bash
+          # PagerDuty sends webhooks to your middleware, which forwards:
+          curl -X POST \
+            -H "Authorization: token $GITHUB_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/org/repo/dispatches \
+            -d '{
+              "event_type": "alert-triggered",
+              "client_payload": {
+                "incident_id": "P1234567",
+                "severity": "critical",
+                "service": "api-gateway",
+                "description": "High error rate detected",
+                "triggered_at": "2024-01-15T10:30:00Z",
+                "runbook_url": "https://wiki.internal/runbooks/api-gateway"
+              }
+            }'
+          ```
+
+          ## Pattern 3: Slack Bot -> GitHub Actions
+
+          ### Slack Slash Command Handler
+          ```python
+          # Flask app that handles Slack slash commands
+          from flask import Flask, request
+          import requests
+
+          @app.route('/slack/command', methods=['POST'])
+          def handle_command():
+              # Verify Slack signature (important!)
+              verify_slack_signature(request)
+
+              text = request.form['text']
+              user = request.form['user_name']
+              channel = request.form['channel_name']
+
+              # Parse command: /deploy staging v1.2.3
+              parts = text.split()
+              action = parts[0] if parts else 'help'
+
+              # Forward to GitHub Actions
+              requests.post(
+                  f'https://api.github.com/repos/org/repo/dispatches',
+                  headers={
+                      'Authorization': f'token {GITHUB_TOKEN}',
+                      'Accept': 'application/vnd.github+json',
+                  },
+                  json={
+                      'event_type': 'slack-command',
+                      'client_payload': {
+                          'action': action,
+                          'args': parts[1:],
+                          'user': user,
+                          'channel': channel,
+                      },
+                  },
+              )
+
+              return {'text': f'Command `{action}` submitted to CI/CD pipeline'}
+          ```
+
+          ## Pattern 4: GitHub Actions as Webhook Server
+
+          ### Using repository_dispatch as a webhook endpoint
+          ```yaml
+          # Any system that can make HTTP POST requests can trigger workflows:
+          # - Monitoring systems (Datadog, New Relic, Prometheus AlertManager)
+          # - CI/CD systems (Jenkins, CircleCI, GitLab CI)
+          # - CMS systems (contentful, Sanity)
+          # - Database migration tools
+          # - Cron services (EasyCron, Cronitor)
+          # - IoT devices
+          # - Customer support tools (Zendesk, Intercom)
+          ```
+
+          ## Security Considerations for Webhooks
+
+          | Practice | Description |
+          |----------|-------------|
+          | **Verify signatures** | Always validate webhook signatures |
+          | **Use middleware** | Never expose GitHub PATs in external systems |
+          | **Validate payloads** | Check required fields exist and are valid |
+          | **Idempotency** | Handle duplicate deliveries gracefully |
+          | **Rate limiting** | Protect against webhook floods |
+          | **Logging** | Log all incoming webhooks for audit |
+          | **Timeout handling** | External webhooks may retry on timeout |
+          EOF
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Event Routing with Validation
+  # ---------------------------------------------------------------------------
+  handle-payment:
+    name: "Handle Payment Event"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'repository_dispatch' &&
+      startsWith(github.event.action, 'payment-')
+    steps:
+      - name: "Process payment event"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const payload = context.payload.client_payload;
+            const eventType = context.payload.action;
+
+            console.log(`Payment event: ${eventType}`);
+            console.log(`Amount: ${payload.amount}`);
+            console.log(`Customer: ${payload.customer}`);
+            console.log(`Idempotency key: ${payload.idempotency_key}`);
+
+            // Pattern: Create an issue for failed payments
+            if (eventType === 'payment-failed') {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[PAYMENT FAILED] Customer ${payload.customer}`,
+                body: [
+                  `## Payment Failure`,
+                  ``,
+                  `| Field | Value |`,
+                  `| --- | --- |`,
+                  `| Event ID | ${payload.stripe_event_id || 'N/A'} |`,
+                  `| Amount | ${payload.amount || 'N/A'} |`,
+                  `| Customer | ${payload.customer || 'N/A'} |`,
+                  `| Time | ${payload.timestamp || new Date().toISOString()} |`,
+                ].join('\n'),
+                labels: ['payment', 'needs-attention'],
+              });
+            }
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Alert Handler
+  # ---------------------------------------------------------------------------
+  handle-alert:
+    name: "Handle Alert"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'repository_dispatch' &&
+      (github.event.action == 'alert-triggered' || github.event.action == 'alert-resolved')
+    steps:
+      - name: "Process alert"
+        run: |
+          echo "=== Alert Event ==="
+          echo "Type: ${{ github.event.action }}"
+          echo "Severity: ${{ github.event.client_payload.severity }}"
+          echo "Service: ${{ github.event.client_payload.service }}"
+          echo "Description: ${{ github.event.client_payload.description }}"
+
+          if [ "${{ github.event.action }}" = "alert-triggered" ]; then
+            echo ""
+            echo "=== AUTO-REMEDIATION ==="
+            SEVERITY="${{ github.event.client_payload.severity }}"
+            case "$SEVERITY" in
+              critical)
+                echo "CRITICAL: Triggering immediate rollback..."
+                ;;
+              high)
+                echo "HIGH: Scaling up service..."
+                ;;
+              medium)
+                echo "MEDIUM: Creating incident ticket..."
+                ;;
+              low)
+                echo "LOW: Logging for review..."
+                ;;
+            esac
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Slack Command Handler
+  # ---------------------------------------------------------------------------
+  handle-slack-command:
+    name: "Handle Slack Command"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'repository_dispatch' &&
+      github.event.action == 'slack-command'
+    steps:
+      - name: "Process Slack command"
+        run: |
+          echo "=== Slack Command ==="
+          echo "Action: ${{ github.event.client_payload.action }}"
+          echo "User: ${{ github.event.client_payload.user }}"
+          echo "Channel: ${{ github.event.client_payload.channel }}"
+          echo "Args: ${{ toJSON(github.event.client_payload.args) }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Idempotency Pattern
+  # ---------------------------------------------------------------------------
+  idempotency-pattern:
+    name: "Idempotency Pattern"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.demo == 'idempotency' || inputs.demo == 'all')
+    steps:
+      - name: "Document idempotency pattern"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## Idempotency in Webhook Handling
+
+          Webhooks can be delivered multiple times due to:
+          - Network timeouts
+          - Retry policies
+          - Server restarts
+          - Concurrent deliveries
+
+          ### Pattern: Idempotency via GitHub Issues
+
+          ```yaml
+          - name: Check for duplicate processing
+            id: dedup
+            uses: actions/github-script@v7
+            with:
+              script: |
+                const idempotencyKey = context.payload.client_payload.idempotency_key;
+
+                // Search for existing issue with this key
+                const issues = await github.rest.issues.listForRepo({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  labels: `idempotency-${idempotencyKey}`,
+                  state: 'all',
+                });
+
+                if (issues.data.length > 0) {
+                  console.log(`Duplicate detected: ${idempotencyKey}`);
+                  core.setOutput('duplicate', 'true');
+                  return;
+                }
+
+                core.setOutput('duplicate', 'false');
+
+          - name: Process event
+            if: steps.dedup.outputs.duplicate != 'true'
+            run: echo "Processing unique event..."
+
+          - name: Mark as processed
+            if: steps.dedup.outputs.duplicate != 'true'
+            uses: actions/github-script@v7
+            with:
+              script: |
+                // Create a tracking issue to prevent reprocessing
+                const key = context.payload.client_payload.idempotency_key;
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `[Processed] Event ${key}`,
+                  labels: [`idempotency-${key}`, 'event-tracking'],
+                  body: `Processed at ${new Date().toISOString()}`,
+                });
+          ```
+
+          ### Pattern: Idempotency via Artifacts
+
+          ```yaml
+          - name: Check processing cache
+            id: cache
+            uses: actions/cache@v4
+            with:
+              path: .processed-events
+              key: event-${{ github.event.client_payload.idempotency_key }}
+
+          - name: Process if not cached
+            if: steps.cache.outputs.cache-hit != 'true'
+            run: |
+              echo "Processing event..."
+              mkdir -p .processed-events
+              echo "processed" > ".processed-events/${{ github.event.client_payload.idempotency_key }}"
+          ```
+          EOF
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Event Routing Table
+  # ---------------------------------------------------------------------------
+  event-router:
+    name: "Event Router (catch-all)"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'repository_dispatch'
+    steps:
+      - name: "Route event"
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          echo "=== EVENT ROUTER ==="
+          echo "Event type: ${{ github.event.action }}"
+          echo "Sender: ${{ github.event.sender.login }}"
+          echo "Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+          echo "Payload:"
+          echo "$PAYLOAD" | jq '.' 2>/dev/null || echo "$PAYLOAD"
+
+          # Log to step summary for audit trail
+          echo "### Event Received" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Type** | \`${{ github.event.action }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Sender** | ${{ github.event.sender.login }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Run ID** | ${{ github.run_id }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Time** | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> "$GITHUB_STEP_SUMMARY"

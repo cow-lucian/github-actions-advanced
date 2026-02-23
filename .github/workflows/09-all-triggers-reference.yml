@@ -1,0 +1,285 @@
+# =============================================================================
+# 09 - All Triggers Reference & Patterns
+# =============================================================================
+# SCHOLAR NOTE:
+#   This workflow is a comprehensive reference for trigger patterns that go
+#   beyond the basics covered in the github-actions-examples repo. Here we
+#   focus on ADVANCED trigger patterns:
+#
+#   1. Multi-trigger workflows (combining events)
+#   2. Trigger-conditional jobs (run different jobs per event)
+#   3. Concurrency control per trigger
+#   4. Filter patterns (advanced glob matching)
+#   5. Activity type routing
+#   6. Trigger context differences
+#
+# KEY INSIGHT: A single workflow file can have MULTIPLE triggers, and you
+# can route to different jobs based on which trigger fired using:
+#   if: github.event_name == 'push'
+#   if: github.event_name == 'pull_request'
+# =============================================================================
+
+name: "09 - All Triggers Reference"
+
+on:
+  # Multiple triggers in one workflow
+  push:
+    branches:
+      - main
+      - 'release/**'
+      - 'hotfix/**'
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+  schedule:
+    # Nightly at 2 AM UTC on weekdays
+    - cron: '0 2 * * 1-5'
+    # Weekly Sunday midnight
+    - cron: '0 0 * * 0'
+
+  workflow_dispatch:
+    inputs:
+      run-mode:
+        description: 'What to run'
+        type: choice
+        options:
+          - full-suite
+          - quick-check
+          - deploy-only
+        default: full-suite
+
+  release:
+    types: [published]
+
+# ---------------------------------------------------------------------------
+# Concurrency: Different strategies per trigger
+# ---------------------------------------------------------------------------
+# The concurrency key prevents multiple runs from conflicting.
+# Using github.event_name in the group means different triggers
+# can run concurrently, but the SAME trigger type will queue/cancel.
+# ---------------------------------------------------------------------------
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event_name == 'pull_request' && github.event.pull_request.number ||
+      github.event_name == 'push' && github.ref ||
+      github.run_id
+    }}
+  # Cancel in-progress runs for PRs (latest commit wins)
+  # Do NOT cancel for push to main (all commits matter)
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Event Router - runs on EVERY trigger, determines what to do
+  # ---------------------------------------------------------------------------
+  event-router:
+    name: "Route: ${{ github.event_name }}"
+    runs-on: ubuntu-latest
+    outputs:
+      should-test: ${{ steps.route.outputs.should-test }}
+      should-build: ${{ steps.route.outputs.should-build }}
+      should-deploy: ${{ steps.route.outputs.should-deploy }}
+      should-audit: ${{ steps.route.outputs.should-audit }}
+      is-production: ${{ steps.route.outputs.is-production }}
+    steps:
+      - name: "Determine actions based on trigger"
+        id: route
+        run: |
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+
+          echo "Event: $EVENT"
+          echo "Ref: $REF"
+
+          # Default everything to false
+          SHOULD_TEST="false"
+          SHOULD_BUILD="false"
+          SHOULD_DEPLOY="false"
+          SHOULD_AUDIT="false"
+          IS_PRODUCTION="false"
+
+          case "$EVENT" in
+            push)
+              SHOULD_TEST="true"
+              SHOULD_BUILD="true"
+              if [ "$REF" = "refs/heads/main" ]; then
+                SHOULD_DEPLOY="true"
+                IS_PRODUCTION="true"
+              fi
+              ;;
+            pull_request)
+              SHOULD_TEST="true"
+              SHOULD_BUILD="true"
+              ;;
+            schedule)
+              SCHEDULE="${{ github.event.schedule }}"
+              case "$SCHEDULE" in
+                "0 2 * * 1-5")
+                  SHOULD_TEST="true"
+                  SHOULD_BUILD="true"
+                  ;;
+                "0 0 * * 0")
+                  SHOULD_AUDIT="true"
+                  ;;
+              esac
+              ;;
+            workflow_dispatch)
+              case "${{ inputs.run-mode }}" in
+                full-suite)
+                  SHOULD_TEST="true"
+                  SHOULD_BUILD="true"
+                  SHOULD_DEPLOY="true"
+                  ;;
+                quick-check)
+                  SHOULD_TEST="true"
+                  ;;
+                deploy-only)
+                  SHOULD_DEPLOY="true"
+                  ;;
+              esac
+              ;;
+            release)
+              SHOULD_BUILD="true"
+              SHOULD_DEPLOY="true"
+              IS_PRODUCTION="true"
+              ;;
+          esac
+
+          echo "should-test=$SHOULD_TEST" >> "$GITHUB_OUTPUT"
+          echo "should-build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "should-deploy=$SHOULD_DEPLOY" >> "$GITHUB_OUTPUT"
+          echo "should-audit=$SHOULD_AUDIT" >> "$GITHUB_OUTPUT"
+          echo "is-production=$IS_PRODUCTION" >> "$GITHUB_OUTPUT"
+
+          echo "=== Routing Decision ==="
+          echo "Test: $SHOULD_TEST | Build: $SHOULD_BUILD | Deploy: $SHOULD_DEPLOY | Audit: $SHOULD_AUDIT"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Test Suite - runs on push, PR, scheduled, dispatch
+  # ---------------------------------------------------------------------------
+  test:
+    name: "Test Suite"
+    needs: event-router
+    if: needs.event-router.outputs.should-test == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Run tests"
+        run: |
+          echo "Running tests triggered by: ${{ github.event_name }}"
+          echo "This job runs for: push, PR, nightly schedule, dispatch(full/quick)"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Build - runs on push, PR, scheduled, dispatch, release
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build"
+    needs: event-router
+    if: needs.event-router.outputs.should-build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Build"
+        run: |
+          echo "Building triggered by: ${{ github.event_name }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Deploy - only on push to main, release, or dispatch(deploy)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "Deploy"
+    needs: [event-router, test, build]
+    if: |
+      always() &&
+      needs.event-router.outputs.should-deploy == 'true' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Deploy"
+        run: |
+          echo "Deploying triggered by: ${{ github.event_name }}"
+          echo "Production: ${{ needs.event-router.outputs.is-production }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Audit - only on weekly schedule
+  # ---------------------------------------------------------------------------
+  weekly-audit:
+    name: "Weekly Security Audit"
+    needs: event-router
+    if: needs.event-router.outputs.should-audit == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Run audit"
+        run: |
+          echo "Running weekly security audit"
+          echo "Schedule: ${{ github.event.schedule }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Trigger Context Differences
+  # ---------------------------------------------------------------------------
+  # Different triggers provide different context. This job documents
+  # what's available in each.
+  # ---------------------------------------------------------------------------
+  context-docs:
+    name: "Trigger Context Reference"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: "Document trigger contexts"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## Trigger Context Differences
+
+          ### github.sha Behavior
+          | Trigger | github.sha Value |
+          |---------|-----------------|
+          | `push` | The commit that was pushed |
+          | `pull_request` | Merge commit SHA (PR head + base) |
+          | `pull_request_target` | Last commit on the BASE branch |
+          | `schedule` | Last commit on the default branch |
+          | `workflow_dispatch` | Last commit on the selected branch |
+          | `release` | Tag commit SHA |
+          | `repository_dispatch` | Last commit on default branch |
+
+          ### github.ref Behavior
+          | Trigger | github.ref Value |
+          |---------|-----------------|
+          | `push` (branch) | `refs/heads/branch-name` |
+          | `push` (tag) | `refs/tags/tag-name` |
+          | `pull_request` | `refs/pull/123/merge` |
+          | `pull_request_target` | `refs/heads/base-branch` |
+          | `schedule` | `refs/heads/default-branch` |
+          | `workflow_dispatch` | Selected branch ref |
+          | `release` | `refs/tags/tag-name` |
+
+          ### Concurrency Patterns by Trigger
+          | Trigger | Recommended Group Key | Cancel In-Progress? |
+          |---------|----------------------|-------------------|
+          | `push` | `${{ github.ref }}` | No (all commits matter) |
+          | `pull_request` | `pr-${{ github.event.pull_request.number }}` | Yes (latest wins) |
+          | `schedule` | Static string | Yes (only latest run needed) |
+          | `workflow_dispatch` | `${{ github.run_id }}` | No (manual = intentional) |
+          | `release` | `release-${{ github.event.release.tag_name }}` | No |
+
+          ### Filter Availability by Trigger
+          | Trigger | branches | tags | paths | types |
+          |---------|----------|------|-------|-------|
+          | `push` | Yes | Yes | Yes | No |
+          | `pull_request` | Yes | No | Yes | Yes |
+          | `pull_request_target` | Yes | No | Yes | Yes |
+          | `schedule` | No | No | No | No |
+          | `workflow_dispatch` | No | No | No | No |
+          | Others | No | No | No | Yes |
+          EOF

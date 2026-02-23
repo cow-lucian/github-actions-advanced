@@ -1,0 +1,571 @@
+# =============================================================================
+# 11 - GitHub App & OAuth App Complete Setup Guide
+# =============================================================================
+# SCHOLAR NOTE:
+#   This workflow is a comprehensive, executable reference for understanding
+#   and setting up GitHub Apps and OAuth Apps. It covers:
+#
+#   1. GitHub App creation, configuration, and usage
+#   2. OAuth App creation, OAuth flow, and scope management
+#   3. Comparison: when to use each authentication method
+#   4. Practical examples of token generation and API usage
+#   5. Security considerations and best practices
+#
+# THE FIVE AUTHENTICATION METHODS IN GITHUB:
+#
+#   +------------------------------------------------------------------+
+#   | 1. GITHUB_TOKEN (automatic)                                      |
+#   |    - Created per workflow run                                    |
+#   |    - No setup needed                                             |
+#   |    - Current repo only, cannot trigger workflows                 |
+#   +------------------------------------------------------------------+
+#   | 2. GitHub App (machine identity)                                 |
+#   |    - JWT + installation token flow                               |
+#   |    - Fine-grained permissions per installation                   |
+#   |    - 1-hour token lifetime, 5000 req/hr per install              |
+#   |    - Can trigger workflows, cross-repo, push to protected        |
+#   +------------------------------------------------------------------+
+#   | 3. Fine-grained PAT (user identity, scoped)                      |
+#   |    - Scoped to specific repos and permissions                    |
+#   |    - Configurable expiry                                         |
+#   |    - Tied to user account                                        |
+#   +------------------------------------------------------------------+
+#   | 4. Classic PAT (user identity, broad)                            |
+#   |    - Scope-based (repo, admin:org, etc.)                         |
+#   |    - Can be non-expiring (dangerous)                             |
+#   |    - Broadest access, least secure                               |
+#   +------------------------------------------------------------------+
+#   | 5. OAuth App (user delegation)                                   |
+#   |    - User authorizes app via browser                             |
+#   |    - Token acts on behalf of the user                            |
+#   |    - Scope-based permissions                                     |
+#   |    - For user-facing applications                                |
+#   +------------------------------------------------------------------+
+# =============================================================================
+
+name: "11 - GitHub App & OAuth App Setup"
+
+on:
+  workflow_dispatch:
+    inputs:
+      demo:
+        description: "Which demo to run"
+        type: choice
+        options:
+          - github-app-setup
+          - github-app-usage
+          - oauth-app-setup
+          - auth-comparison
+          - all
+        default: all
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # GITHUB APP SECTION
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Job 1: GitHub App Setup Guide
+  # ---------------------------------------------------------------------------
+  github-app-setup:
+    name: "GitHub App: Setup Guide"
+    runs-on: ubuntu-latest
+    if: >
+      inputs.demo == 'github-app-setup' || inputs.demo == 'all'
+    steps:
+      - name: "Complete GitHub App setup guide"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          # GitHub App Complete Setup Guide
+
+          ## Part 1: Create the GitHub App
+
+          ### Via GitHub UI
+          1. Navigate to **Settings** > **Developer settings** > **GitHub Apps**
+          2. Click **New GitHub App**
+          3. Configure:
+
+          | Field | Value | Notes |
+          |-------|-------|-------|
+          | **App name** | `my-org-ci-bot` | Must be unique across GitHub |
+          | **Homepage URL** | `https://github.com/my-org` | Your org page |
+          | **Webhook** | Uncheck "Active" | Not needed for CI token use |
+          | **Webhook URL** | _(blank)_ | Only if processing webhooks |
+          | **Webhook secret** | _(blank)_ | Only if processing webhooks |
+
+          ### Via GitHub CLI
+          ```bash
+          # Create a manifest file
+          cat > app-manifest.json << 'MANIFEST'
+          {
+            "name": "My CI Bot",
+            "url": "https://github.com/my-org",
+            "hook_attributes": { "active": false },
+            "public": false,
+            "default_permissions": {
+              "contents": "write",
+              "pull_requests": "write",
+              "issues": "write",
+              "actions": "write",
+              "checks": "write",
+              "deployments": "write",
+              "statuses": "write"
+            },
+            "default_events": []
+          }
+          MANIFEST
+          ```
+
+          ## Part 2: Configure Permissions
+
+          ### Repository Permissions
+          | Permission | Level | Use Case |
+          |------------|-------|----------|
+          | **Contents** | Read & Write | Push code, create/delete branches |
+          | **Pull requests** | Read & Write | Create PRs, approve, merge |
+          | **Issues** | Read & Write | Create issues, add comments |
+          | **Actions** | Read & Write | Manage workflow runs |
+          | **Checks** | Read & Write | Create check runs and suites |
+          | **Deployments** | Read & Write | Create and update deployments |
+          | **Statuses** | Read & Write | Set commit statuses |
+          | **Workflows** | Read & Write | Modify workflow files |
+          | **Packages** | Read & Write | Publish to GitHub Packages |
+          | **Administration** | Read | Read repo settings |
+          | **Metadata** | Read | Always required (auto-granted) |
+
+          ### Organization Permissions (if needed)
+          | Permission | Level | Use Case |
+          |------------|-------|----------|
+          | **Members** | Read | Read org members |
+          | **Plan** | Read | Check org plan features |
+
+          ## Part 3: Generate Private Key
+
+          1. On the App's settings page, scroll to **Private keys**
+          2. Click **Generate a private key**
+          3. A `.pem` file downloads automatically
+          4. **Store this file securely** - it cannot be downloaded again
+
+          ## Part 4: Install the App
+
+          1. Go to the App's settings page
+          2. Click **Install App** in the left sidebar
+          3. Choose your organization or personal account
+          4. Select **All repositories** or **Only select repositories**
+          5. Click **Install**
+          6. Note the **Installation ID** from the URL:
+             `https://github.com/settings/installations/12345678`
+
+          ## Part 5: Store Secrets
+
+          ```bash
+          # Store the App ID (numeric, from the App settings page)
+          gh secret set APP_ID --body "123456"
+
+          # Store the private key (entire PEM file)
+          gh secret set APP_PRIVATE_KEY < path/to/private-key.pem
+
+          # Optionally store the installation ID
+          gh secret set APP_INSTALLATION_ID --body "12345678"
+          ```
+
+          ## Part 6: Webhook Configuration (Optional)
+
+          If your App needs to receive webhooks:
+          1. Set **Webhook URL** to your server endpoint
+          2. Generate a **Webhook secret**
+          3. Subscribe to events (issues, pull_request, push, etc.)
+          4. Verify webhook signatures in your handler:
+          ```javascript
+          const crypto = require('crypto');
+          const sig = req.headers['x-hub-signature-256'];
+          const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
+          hmac.update(JSON.stringify(req.body));
+          const digest = 'sha256=' + hmac.digest('hex');
+          if (sig !== digest) throw new Error('Invalid signature');
+          ```
+          EOF
+
+  # ---------------------------------------------------------------------------
+  # Job 2: GitHub App Usage Patterns
+  # ---------------------------------------------------------------------------
+  github-app-usage:
+    name: "GitHub App: Usage Patterns"
+    runs-on: ubuntu-latest
+    if: >
+      inputs.demo == 'github-app-usage' || inputs.demo == 'all'
+    steps:
+      - name: "Practical GitHub App usage patterns"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          # GitHub App Usage Patterns
+
+          ## Pattern 1: Generate Token with Official Action
+          ```yaml
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - name: Generate App Token
+                  id: app-token
+                  uses: actions/create-github-app-token@v1
+                  with:
+                    app-id: ${{ secrets.APP_ID }}
+                    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+                - name: Use token
+                  run: echo "Token: ${{ steps.app-token.outputs.token }}"
+          ```
+
+          ## Pattern 2: Cross-Repository Operations
+          ```yaml
+          - name: Generate token for other repos
+            id: app-token
+            uses: actions/create-github-app-token@v1
+            with:
+              app-id: ${{ secrets.APP_ID }}
+              private-key: ${{ secrets.APP_PRIVATE_KEY }}
+              repositories: 'frontend,backend,infra'
+              owner: 'my-org'
+
+          - name: Trigger deployment in another repo
+            run: |
+              gh api repos/my-org/infra/dispatches \
+                -f event_type=deploy \
+                -f 'client_payload={"version":"v1.2.3"}'
+            env:
+              GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ```
+
+          ## Pattern 3: Push to Protected Branches
+          ```yaml
+          - name: Generate App Token
+            id: app-token
+            uses: actions/create-github-app-token@v1
+            with:
+              app-id: ${{ secrets.APP_ID }}
+              private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+          # IMPORTANT: Add the App as a "bypass actor" in branch protection
+          # Settings > Branches > Branch protection > Allow specified actors to bypass
+
+          - name: Checkout with App token
+            uses: actions/checkout@v4
+            with:
+              token: ${{ steps.app-token.outputs.token }}
+
+          - name: Push changes (triggers other workflows!)
+            run: |
+              git config user.name "my-ci-bot[bot]"
+              git config user.email "123456+my-ci-bot[bot]@users.noreply.github.com"
+              git add .
+              git commit -m "chore: automated update"
+              git push
+          ```
+
+          ## Pattern 4: Create PRs That Trigger CI
+          ```yaml
+          - uses: actions/create-github-app-token@v1
+            id: app-token
+            with:
+              app-id: ${{ secrets.APP_ID }}
+              private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+          - name: Create PR (will trigger PR workflows)
+            run: |
+              git checkout -b automated-update
+              # ... make changes ...
+              git push origin automated-update
+              gh pr create \
+                --title "chore: automated dependency update" \
+                --body "This PR was created by the CI bot"
+            env:
+              GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ```
+
+          ## Pattern 5: Reusable Workflow with App Auth
+          ```yaml
+          # Caller workflow
+          jobs:
+            get-token:
+              uses: my-org/workflows/.github/workflows/app-auth.yml@main
+              secrets:
+                app-id: ${{ secrets.APP_ID }}
+                app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            deploy:
+              needs: get-token
+              runs-on: ubuntu-latest
+              steps:
+                - name: Deploy with elevated permissions
+                  run: ./deploy.sh
+                  env:
+                    DEPLOY_TOKEN: ${{ needs.get-token.outputs.token }}
+          ```
+
+          ## Rate Limits
+          | Auth Method | Requests/Hour | Notes |
+          |-------------|--------------|-------|
+          | GITHUB_TOKEN | 1,000 | Per workflow run |
+          | GitHub App | 5,000 | Per installation |
+          | PAT | 5,000 | Per user |
+          | Unauthenticated | 60 | Per IP |
+          EOF
+
+  # ===========================================================================
+  # OAUTH APP SECTION
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Job 3: OAuth App Setup Guide
+  # ---------------------------------------------------------------------------
+  oauth-app-setup:
+    name: "OAuth App: Complete Setup"
+    runs-on: ubuntu-latest
+    if: >
+      inputs.demo == 'oauth-app-setup' || inputs.demo == 'all'
+    steps:
+      - name: "Complete OAuth App guide"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          # OAuth App Complete Setup Guide
+
+          ## When to Use an OAuth App
+          - You need users to authorize your application
+          - Your app acts **on behalf of a user** (not as a bot)
+          - You're building a web application with "Login with GitHub"
+          - You need access to user-specific data (emails, profile)
+
+          ## Part 1: Create the OAuth App
+
+          1. Go to **Settings** > **Developer settings** > **OAuth Apps**
+          2. Click **New OAuth App**
+          3. Configure:
+
+          | Field | Value |
+          |-------|-------|
+          | **Application name** | Your app name |
+          | **Homepage URL** | `https://yourapp.com` |
+          | **Authorization callback URL** | `https://yourapp.com/auth/callback` |
+          | **Enable Device Flow** | Check if building CLI apps |
+
+          ## Part 2: OAuth 2.0 Web Application Flow
+
+          ```
+          Browser                    Your Server              GitHub
+            |                           |                       |
+            | 1. Click "Login"          |                       |
+            |-------------------------->|                       |
+            |                           |                       |
+            | 2. Redirect to GitHub     |                       |
+            |<--------------------------|                       |
+            |                           |                       |
+            | 3. GET /login/oauth/authorize                     |
+            |   ?client_id=abc                                  |
+            |   &redirect_uri=https://app.com/callback          |
+            |   &scope=repo,user:email                          |
+            |   &state=random123                                |
+            |-------------------------------------------------->|
+            |                           |                       |
+            | 4. User authorizes        |                       |
+            |<--------------------------------------------------|
+            |                           |                       |
+            | 5. Redirect to callback   |                       |
+            |   ?code=temp_code         |                       |
+            |   &state=random123        |                       |
+            |-------------------------->|                       |
+            |                           |                       |
+            |                           | 6. Exchange code      |
+            |                           |   POST /login/oauth/  |
+            |                           |     access_token      |
+            |                           |   client_id=abc       |
+            |                           |   client_secret=xyz   |
+            |                           |   code=temp_code      |
+            |                           |---------------------->|
+            |                           |                       |
+            |                           | 7. Receive token      |
+            |                           |<----------------------|
+            |                           |                       |
+            | 8. Set session cookie     |                       |
+            |<--------------------------|                       |
+          ```
+
+          ## Part 3: OAuth Scopes (Complete Reference)
+
+          ### Repository Scopes
+          | Scope | Access |
+          |-------|--------|
+          | `repo` | Full control of private repos |
+          | `repo:status` | Read/write commit status |
+          | `repo_deployment` | Access deployment status |
+          | `public_repo` | Access public repos only |
+          | `repo:invite` | Accept/decline invitations |
+          | `security_events` | Read/write security events |
+
+          ### Admin Scopes
+          | Scope | Access |
+          |-------|--------|
+          | `admin:org` | Full control of orgs and teams |
+          | `write:org` | Read and write org membership |
+          | `read:org` | Read org membership |
+          | `admin:public_key` | Full control of public keys |
+          | `admin:repo_hook` | Full control of repo webhooks |
+          | `admin:org_hook` | Full control of org webhooks |
+          | `admin:gpg_key` | Full control of GPG keys |
+
+          ### User Scopes
+          | Scope | Access |
+          |-------|--------|
+          | `user` | Read/write all profile info |
+          | `user:email` | Read email addresses |
+          | `user:follow` | Follow and unfollow users |
+          | `read:user` | Read user profile data |
+
+          ### Other Scopes
+          | Scope | Access |
+          |-------|--------|
+          | `workflow` | Update workflow files (.github/workflows/) |
+          | `packages` | Manage GitHub Packages |
+          | `write:packages` | Upload packages |
+          | `read:packages` | Download packages |
+          | `delete:packages` | Delete packages |
+          | `notifications` | Access notifications |
+          | `gist` | Create gists |
+          | `project` | Read/write projects |
+          | `codespace` | Manage codespaces |
+
+          > **The `workflow` scope is specifically required to push changes to
+          > `.github/workflows/` files via the API.** This is why the error
+          > "refusing to allow an OAuth App to create or update workflow"
+          > occurs without it.
+
+          ## Part 4: Device Flow (for CLI Tools)
+
+          ```bash
+          # Step 1: Request device code
+          curl -X POST https://github.com/login/oauth/device/code \
+            -d "client_id=YOUR_CLIENT_ID&scope=repo,user:email"
+
+          # Response:
+          # {
+          #   "device_code": "abc...",
+          #   "user_code": "ABCD-1234",
+          #   "verification_uri": "https://github.com/login/device",
+          #   "interval": 5
+          # }
+
+          # Step 2: Tell user to visit the URL and enter the code
+          echo "Visit https://github.com/login/device"
+          echo "Enter code: ABCD-1234"
+
+          # Step 3: Poll for authorization
+          while true; do
+            RESPONSE=$(curl -s -X POST \
+              https://github.com/login/oauth/access_token \
+              -d "client_id=YOUR_CLIENT_ID" \
+              -d "device_code=DEVICE_CODE" \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+              -H "Accept: application/json")
+
+            ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
+            if [ -z "$ERROR" ]; then
+              TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+              echo "Authorized! Token: $TOKEN"
+              break
+            fi
+            sleep 5
+          done
+          ```
+
+          ## Part 5: Security Checklist
+          - [ ] Validate `state` parameter to prevent CSRF
+          - [ ] Use HTTPS for all redirect URIs
+          - [ ] Request minimum scopes needed
+          - [ ] Store tokens encrypted at rest
+          - [ ] Implement token revocation on logout
+          - [ ] Never log or expose Client Secret
+          - [ ] Use environment variables for credentials
+          - [ ] Implement rate limiting on your callback endpoint
+          EOF
+
+  # ===========================================================================
+  # COMPARISON SECTION
+  # ===========================================================================
+
+  auth-comparison:
+    name: "Authentication Methods Comparison"
+    runs-on: ubuntu-latest
+    if: >
+      inputs.demo == 'auth-comparison' || inputs.demo == 'all'
+    steps:
+      - name: "Comprehensive comparison"
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          # GitHub Authentication Methods: Complete Comparison
+
+          ## Decision Tree
+          ```
+          Do you need to authenticate in GitHub Actions?
+          |
+          +--> Is the current repo + basic permissions enough?
+          |    |
+          |    +--> YES --> Use GITHUB_TOKEN
+          |    |
+          |    +--> NO --> Do you need to act as a user?
+          |               |
+          |               +--> YES --> Is it a web app with login?
+          |               |    |
+          |               |    +--> YES --> Use OAuth App
+          |               |    |
+          |               |    +--> NO --> Use Fine-grained PAT
+          |               |
+          |               +--> NO --> Do you need cross-repo or workflow triggers?
+          |                    |
+          |                    +--> YES --> Use GitHub App
+          |                    |
+          |                    +--> NO --> Use GITHUB_TOKEN
+          ```
+
+          ## Feature Comparison Matrix
+
+          | Feature | GITHUB_TOKEN | GitHub App | Fine-grained PAT | Classic PAT | OAuth App |
+          |---------|:---:|:---:|:---:|:---:|:---:|
+          | **No setup needed** | Yes | No | No | No | No |
+          | **Cross-repo** | No | Yes | Yes | Yes | Yes |
+          | **Trigger workflows** | No | Yes | Yes | Yes | Yes |
+          | **Protected branches** | No | Yes* | Yes | Yes | Yes |
+          | **Auto-expires** | Yes (job) | Yes (1hr) | Config | Optional | No |
+          | **Machine identity** | Yes | Yes | No | No | No |
+          | **User delegation** | No | No | No | No | Yes |
+          | **Rate limit** | 1000/hr | 5000/hr | 5000/hr | 5000/hr | 5000/hr |
+          | **Fine-grained perms** | Yes | Yes | Yes | No | No |
+          | **Audit trail** | Run-level | App-level | User-level | User-level | App-level |
+          | **Survives user leaving** | Yes | Yes | No | No | No |
+
+          *Requires adding the App as a bypass actor in branch protection
+
+          ## Security Ranking (Most to Least Secure)
+          1. **OIDC Token** - No stored secrets, federated identity
+          2. **GITHUB_TOKEN** - Auto-generated, minimal scope, auto-expires
+          3. **GitHub App Token** - Short-lived, fine-grained, auditable
+          4. **Fine-grained PAT** - Scoped repos/perms, configurable expiry
+          5. **OAuth App Token** - User-delegated, scope-based
+          6. **Classic PAT** - Broad scope, can be non-expiring (avoid!)
+
+          ## Practical Recommendations
+
+          | Scenario | Recommendation |
+          |----------|---------------|
+          | Standard CI/CD (build, test) | GITHUB_TOKEN |
+          | Deploy to cloud (AWS/Azure/GCP) | OIDC |
+          | Create PRs that trigger CI | GitHub App |
+          | Cross-repo operations | GitHub App |
+          | Automated dependency updates | GitHub App |
+          | Push to protected branches | GitHub App |
+          | User-facing "Login with GitHub" | OAuth App |
+          | One-time scripting | Fine-grained PAT |
+          | Legacy systems | Classic PAT (migrate away!) |
+          EOF
